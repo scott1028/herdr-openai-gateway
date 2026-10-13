@@ -1,0 +1,122 @@
+# herdr-openai-server configuration example.
+#
+# Every option is listed with its default value, so this file changes nothing.
+# Copy it to ~/.config/herdr-openai-server/config.toml (or $XDG_CONFIG_HOME/herdr-openai-server/config.toml)
+# and edit. A config file is optional: with no file at all the built-in defaults
+# below are used. Unknown keys are rejected.
+
+[server]
+# Bind address. Keep it on loopback unless you know what you are doing: the
+# server runs real coding agents with the permissions of your local install.
+listen = "127.0.0.1:8787"
+# Name of the environment variable holding the API key clients must send in
+# `Authorization: Bearer <key>`. Empty or unset means no key is required.
+api_key_env = "HERDR_OPENAI_SERVER_API_KEY"
+# Allow non-loopback Host/Origin headers. Only set this behind your own proxy
+# or VPN, and always together with an API key.
+allow_remote = false
+
+[herdr]
+# Path to the herdr server socket. Unset means the socket herdr itself uses
+# (HERDR_SOCKET_PATH, then the default per-user socket).
+# socket = "/run/user/1000/herdr/herdr.sock"
+# Herdr session to work in. Unset means the session the socket serves.
+# session = "default"
+# Label of the herdr workspace this bridge creates and owns.
+workspace_label = "openai-api"
+# How long a freshly spawned backing agent has to reach its interactive prompt.
+# Must be in (3000, 300000].
+startup_timeout_ms = 60000
+# Overall limit for one backing turn, from prompt to reply.
+turn_timeout_ms = 1800000
+# How long a backing agent may sit waiting on a dialog (relayed to the client, or
+# an approval in its herdr tab) before the turn gives up; a relayed dialog expires
+# after this and the next answer gets an explanatory reply.
+blocked_timeout_ms = 600000
+# Extra time after the agent looks idle to catch a reply that lands late.
+completion_grace_ms = 15000
+
+[conversations]
+# Close a conversation's backing agent after this much idle time; the
+# conversation itself is kept, so the next request respawns the agent.
+idle_ttl_secs = 1800
+# Cap on live agents for one model id. Over the cap, the least recently used
+# conversation is evicted.
+max_agents_per_model = 3
+# Cap on live agents overall.
+max_agents_total = 8
+
+[defaults]
+# Last resort for the agent cwd. Precedence: `X-Herdr-Cwd`, then the `Working directory`
+# line in the client's system prompt, then the model's `cwd`, then this. `~` expands to home.
+cwd = "~"
+# Requests may only ask for a working directory inside these roots. This is the
+# main guard against a client pointing an agent at an arbitrary directory.
+allowed_cwd_roots = ["~"]
+
+[discovery]
+# Offer shell functions, aliases and PATH commands named claude/codex or
+# claude-*/codex-* as models automatically; restart serve to re-scan.
+enabled = true
+# Interactive shell to scan. Unset means $SHELL; only bash and zsh work.
+# shell = "/bin/bash"
+# Names forced in (even PATH files) and names always dropped.
+include = []
+exclude = []
+# How long the shell scan may run, in milliseconds.
+timeout_ms = 10000
+
+# Models offered on /v1/models. With [discovery] enabled (the default) the list
+# comes from your shell functions/aliases/commands named claude*/codex*, and
+# each `[[models]]` entry below replaces the model with the same id or adds a
+# new one. With discovery disabled, any `[[models]]` entry replaces the whole
+# built-in list: one entry means one model.
+#
+# `id` is what clients put in `model`. Only a `+client-tools` suffix selects
+# the tool-call bridge: the agent's own execution is turned off for Claude and
+# limited to a read-only sandbox for Codex, and opencode's tools are offered to
+# it as text instead. Any other id (by convention a `+agent-tools` suffix)
+# runs the agent itself: it executes its own tools, and client tools are ignored.
+# `kind` is the herdr agent type: claude or codex.
+# `command` is the shell command that starts the CLI; it must start with the
+# kind's base name. Unset means `claude`/`codex` themselves, started through
+# herdr; any other command (a shell function like `claude-personal`) is typed
+# into the tab's shell instead.
+# `args` are extra command-line arguments for that CLI.
+
+# self-exec: the agent runs its own tools in the herdr tab; the client sees only the final text.
+[[models]]
+id = "claude+agent-tools"
+kind = "claude"
+
+# bridge: the agent only chooses client tools; the client runs them and shows its own tool UI.
+[[models]]
+id = "claude+client-tools"
+kind = "claude"
+args = ["--tools", "", "--strict-mcp-config"]
+
+# self-exec: as above, Codex CLI.
+[[models]]
+id = "codex+agent-tools"
+kind = "codex"
+
+# bridge: Codex keeps a read-only shell (no approvals); the protocol tells it not to use it.
+[[models]]
+id = "codex+client-tools"
+kind = "codex"
+args = ["-s", "read-only", "-a", "never"]
+
+# Custom models are the point of this section: pick a CLI profile, a permission
+# mode, or a project directory per model id.
+#
+# [[models]]
+# id = "claude-work+agent-tools"
+# kind = "claude"
+# args = ["--permission-mode", "acceptEdits"]
+# env = { CLAUDE_CONFIG_DIR = "~/.claude-work" }
+# cwd = "~/work/repo"
+#
+# [[models]]
+# id = "codex-write+agent-tools"
+# kind = "codex"
+# args = ["-s", "workspace-write"]

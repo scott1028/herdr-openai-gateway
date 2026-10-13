@@ -1,0 +1,5 @@
+{"type":"session_meta","payload":{"id":"sess-1","cwd":"/tmp/project","timestamp":"2026-10-14T00:00:00.000Z"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"t1","started_at":1760457600}}
+{"type":"event_msg","payload":{"type":"user_message","message":"hello","images":[],"local_images":[]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"hi there"}]}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"hi there","completed_at":1760457603,"duration_ms":3000}}

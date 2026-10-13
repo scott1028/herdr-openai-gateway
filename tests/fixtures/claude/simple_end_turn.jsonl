@@ -1,0 +1,3 @@
+{"type":"user","message":{"content":"hello"}}
+{"type":"assistant","message":{"id":"msg_01","content":[{"type":"text","text":"hi there"}],"stop_reason":"end_turn"}}
+{"type":"system","subtype":"turn_duration","isMeta":false,"durationMs":120}

@@ -1,0 +1,2 @@
+{"type":"user","message":{"content":"hi"}}
+{"type":"assistant","isApiErrorMessage":true,"message":{"id":"msg_err","model":"<synthetic>","content":[{"type":"text","text":"API Error: 529 overloaded"}],"stop_reason":"stop_sequence"}}

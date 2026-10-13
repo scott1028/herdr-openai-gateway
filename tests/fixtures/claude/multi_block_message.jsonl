@@ -1,0 +1,5 @@
+{"type":"user","message":{"content":"hi"}}
+{"type":"assistant","message":{"id":"msg_01","content":[{"type":"thinking","thinking":"let me think"}],"stop_reason":"tool_use"}}
+{"type":"assistant","message":{"id":"msg_01","content":[{"type":"text","text":"part one"}],"stop_reason":"tool_use"}}
+{"type":"assistant","message":{"id":"msg_01","content":[{"type":"text","text":"part two"}],"stop_reason":"end_turn"}}
+{"type":"system","subtype":"turn_duration","isMeta":false,"durationMs":300}

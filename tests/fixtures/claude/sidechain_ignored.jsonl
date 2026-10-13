@@ -1,0 +1,13 @@
+{"type":"user","message":{"content":"hi"}}
+{"type":"assistant","isSidechain":true,"message":{"id":"msg_sc","content":[{"type":"text","text":"side answer"}],"stop_reason":"end_turn"}}
+{"type":"user","isMeta":true,"message":{"content":"<local-command>noise</local-command>"}}
+{"type":"attachment","attachment":{"type":"file","name":"x.txt"}}
+{"type":"ai-title","aiTitle":"greeting"}
+{"type":"mode","mode":"normal"}
+{"type":"permission-mode","permissionMode":"default"}
+{"type":"last-prompt","lastPrompt":"hi"}
+{"type":"queue-operation","operation":"dequeue"}
+{"type":"file-history-snapshot","snapshot":{}}
+{"type":"atis-latch","value":true}
+{"type":"assistant","message":{"id":"msg_02","content":[{"type":"text","text":"real answer"}],"stop_reason":"end_turn"}}
+{"type":"system","subtype":"turn_duration","isMeta":false,"durationMs":90}

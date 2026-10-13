@@ -1,0 +1,4 @@
+{"type":"session_meta","payload":{"id":"sess-4","cwd":"/tmp/project","timestamp":"2026-10-14T00:00:00.000Z"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"t1","started_at":1760457600}}
+{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"","error":{"message":"Your workspace is out of credits","codex_error_info":{"kind":"usage_limit_reached"}},"completed_at":1760457602,"duration_ms":2000}}

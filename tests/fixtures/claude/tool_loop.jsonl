@@ -1,0 +1,5 @@
+{"type":"user","message":{"content":"list files"}}
+{"type":"assistant","message":{"id":"msg_01","content":[{"type":"tool_use","id":"tu_01","name":"Bash","input":{"command":"ls"}}],"stop_reason":"tool_use"}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu_01","content":"a.txt"}]}}
+{"type":"assistant","message":{"id":"msg_02","content":[{"type":"text","text":"one file"}],"stop_reason":"end_turn"}}
+{"type":"system","subtype":"turn_duration","isMeta":false,"durationMs":400}
