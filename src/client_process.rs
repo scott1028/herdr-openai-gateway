@@ -174,7 +174,7 @@ mod tests {
     impl FakeProc {
         fn new() -> Self {
             let root = std::env::temp_dir().join(format!(
-                "herdr-openai-server-proc-{}-{}",
+                "herdr-openai-gateway-proc-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

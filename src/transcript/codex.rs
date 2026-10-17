@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn locate_walks_dates_newest_first_and_matches_suffix() {
         let dir = std::env::temp_dir().join(format!(
-            "herdr-openai-server-codex-locate-{}-{}",
+            "herdr-openai-gateway-codex-locate-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn locate_rejects_path_like_session_ids() {
         let dir = std::env::temp_dir().join(format!(
-            "herdr-openai-server-codex-ids-{}-{}",
+            "herdr-openai-gateway-codex-ids-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

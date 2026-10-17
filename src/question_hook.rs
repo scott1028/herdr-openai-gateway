@@ -152,9 +152,9 @@ pub fn claude_settings_arg(url: &str, timeout_secs: u64) -> String {
                     "url": url,
                     "timeout": timeout_secs,
                     "headers": {
-                        "X-Herdr-Hook-Token": "$HERDR_OPENAI_SERVER_HOOK_TOKEN"
+                        "X-Herdr-Hook-Token": "$HERDR_OPENAI_GATEWAY_HOOK_TOKEN"
                     },
-                    "allowedEnvVars": ["HERDR_OPENAI_SERVER_HOOK_TOKEN"],
+                    "allowedEnvVars": ["HERDR_OPENAI_GATEWAY_HOOK_TOKEN"],
                 }]
             }]
         }
@@ -264,11 +264,11 @@ mod tests {
         assert_eq!(hook["hooks"][0]["timeout"], 60);
         assert_eq!(
             hook["hooks"][0]["headers"]["X-Herdr-Hook-Token"],
-            "$HERDR_OPENAI_SERVER_HOOK_TOKEN"
+            "$HERDR_OPENAI_GATEWAY_HOOK_TOKEN"
         );
         assert_eq!(
             hook["hooks"][0]["allowedEnvVars"][0],
-            "HERDR_OPENAI_SERVER_HOOK_TOKEN"
+            "HERDR_OPENAI_GATEWAY_HOOK_TOKEN"
         );
     }
 }

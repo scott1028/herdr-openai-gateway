@@ -193,7 +193,7 @@ async fn get_model<H: HerdrApi>(
         description: model.description(),
         object: "model",
         created: service.created(),
-        owned_by: "herdr-openai-server",
+        owned_by: "herdr-openai-gateway",
     })
     .into_response()
 }

@@ -12,10 +12,10 @@ use crate::herdr::{
 };
 use crate::openai::ApiError;
 
-/// Tab labels owned by herdr-openai-server start with this prefix; nothing else is ever closed.
+/// Tab labels owned by herdr-openai-gateway start with this prefix; nothing else is ever closed.
 pub const TAB_LABEL_PREFIX: &str = "oa:";
 /// `pane.report_metadata` source for the owner token.
-pub const OWNER_TOKEN_SOURCE: &str = "herdr-openai-server";
+pub const OWNER_TOKEN_SOURCE: &str = "herdr-openai-gateway";
 /// Pane token naming the server instance that owns a backing tab; tabs another
 /// live instance owns are never closed.
 pub const OWNER_TOKEN_KEY: &str = "oa_owner";
@@ -706,7 +706,7 @@ mod tests {
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "herdr-openai-server-lc-{tag}-{}-{}",
+            "herdr-openai-gateway-lc-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -952,7 +952,7 @@ mod tests {
         let extras = LaunchExtras {
             args: vec!["--settings".to_string(), settings.clone()],
             env: BTreeMap::from([(
-                "HERDR_OPENAI_SERVER_HOOK_TOKEN".to_string(),
+                "HERDR_OPENAI_GATEWAY_HOOK_TOKEN".to_string(),
                 "secret-value".to_string(),
             )]),
         };
@@ -984,7 +984,7 @@ mod tests {
             .find(|call| call.method == "tab.create")
             .expect("tab.create");
         assert_eq!(
-            tab.param("env.HERDR_OPENAI_SERVER_HOOK_TOKEN"),
+            tab.param("env.HERDR_OPENAI_GATEWAY_HOOK_TOKEN"),
             Some("secret-value")
         );
     }
@@ -1002,7 +1002,7 @@ mod tests {
         let extras = LaunchExtras {
             args: vec!["--settings".to_string(), settings],
             env: BTreeMap::from([(
-                "HERDR_OPENAI_SERVER_HOOK_TOKEN".to_string(),
+                "HERDR_OPENAI_GATEWAY_HOOK_TOKEN".to_string(),
                 "secret-value".to_string(),
             )]),
         };
@@ -1032,7 +1032,7 @@ mod tests {
             .find(|call| call.method == "tab.create")
             .expect("tab.create");
         assert_eq!(
-            tab.param("env.HERDR_OPENAI_SERVER_HOOK_TOKEN"),
+            tab.param("env.HERDR_OPENAI_GATEWAY_HOOK_TOKEN"),
             Some("secret-value")
         );
     }

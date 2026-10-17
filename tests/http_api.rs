@@ -13,10 +13,10 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use herdr_openai_server::config::Config;
-use herdr_openai_server::herdr::fake::{FakeHerdr, ScriptedTurn};
-use herdr_openai_server::server;
-use herdr_openai_server::service::{QuestionHookEnv, Service, ServiceEnv};
+use herdr_openai_gateway::config::Config;
+use herdr_openai_gateway::herdr::fake::{FakeHerdr, ScriptedTurn};
+use herdr_openai_gateway::server;
+use herdr_openai_gateway::service::{QuestionHookEnv, Service, ServiceEnv};
 
 struct TestApp {
     dir: PathBuf,
@@ -52,7 +52,7 @@ impl TestApp {
         question_hook: Option<QuestionHookEnv>,
     ) -> Self {
         let dir = std::env::temp_dir().join(format!(
-            "herdr-openai-server-http-{}-{}",
+            "herdr-openai-gateway-http-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1095,7 +1095,7 @@ async fn bridge_tool_calls_then_tool_results_round_trip() {
 
     let prompts = prompt_texts(&app.fake);
     let first_prompt = prompts.first().expect("first prompt");
-    assert!(first_prompt.contains("[herdr-openai-server bridge protocol v1]"));
+    assert!(first_prompt.contains("[herdr-openai-gateway bridge protocol v1]"));
     assert!(first_prompt.contains("<client_system>\nYou are helpful.\n</client_system>"));
     assert!(first_prompt.contains("\"name\":\"read\""));
     assert!(first_prompt.ends_with("## Current message\nread a.txt"));
@@ -1366,9 +1366,9 @@ async fn variant_model_launches_by_typing_command_base_stays_managed() {
     let mut config = test_config();
     // Unmanaged agents need herdr's 3 s settle before the rename.
     config.herdr.startup_timeout_ms = 10_000;
-    let variants = vec![herdr_openai_server::discovery::Variant {
+    let variants = vec![herdr_openai_gateway::discovery::Variant {
         name: "claude-personal".to_string(),
-        kind: herdr_openai_server::config::AgentKind::Claude,
+        kind: herdr_openai_gateway::config::AgentKind::Claude,
         config_home: None,
     }];
     config.models = config.effective_models(&variants);

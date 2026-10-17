@@ -53,7 +53,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen: "127.0.0.1:8787".to_string(),
-            api_key_env: "HERDR_OPENAI_SERVER_API_KEY".to_string(),
+            api_key_env: "HERDR_OPENAI_GATEWAY_API_KEY".to_string(),
             allow_remote: false,
         }
     }
@@ -441,7 +441,7 @@ fn builtin_models() -> Vec<ModelSpec> {
     .collect()
 }
 
-/// Resolve the default config path: `$XDG_CONFIG_HOME|~/.config` + `herdr-openai-server/config.toml`.
+/// Resolve the default config path: `$XDG_CONFIG_HOME|~/.config` + `herdr-openai-gateway/config.toml`.
 pub fn default_config_path<F>(env: F) -> PathBuf
 where
     F: Fn(&str) -> Option<String>,
@@ -450,7 +450,7 @@ where
         Some(dir) => PathBuf::from(dir),
         None => PathBuf::from(env("HOME").unwrap_or_default()).join(".config"),
     };
-    base.join("herdr-openai-server").join("config.toml")
+    base.join("herdr-openai-gateway").join("config.toml")
 }
 
 /// Expand a leading `~` or `~/` against the given home directory.
@@ -485,7 +485,7 @@ mod tests {
     fn empty_toml_uses_all_defaults_and_builtin_models() {
         let config = Config::from_toml_str("").expect("empty toml is valid");
         assert_eq!(config.server.listen, "127.0.0.1:8787");
-        assert_eq!(config.server.api_key_env, "HERDR_OPENAI_SERVER_API_KEY");
+        assert_eq!(config.server.api_key_env, "HERDR_OPENAI_GATEWAY_API_KEY");
         assert!(!config.server.allow_remote);
         assert_eq!(config.herdr.workspace_label, "openai-api");
         assert_eq!(config.herdr.startup_timeout_ms, 60_000);
@@ -547,7 +547,7 @@ args = ["--permission-mode", "acceptEdits"]
         )
         .expect("partial toml");
         assert_eq!(config.server.listen, "127.0.0.1:9000");
-        assert_eq!(config.server.api_key_env, "HERDR_OPENAI_SERVER_API_KEY");
+        assert_eq!(config.server.api_key_env, "HERDR_OPENAI_GATEWAY_API_KEY");
         assert_eq!(config.herdr.workspace_label, "openai-api");
         assert_eq!(config.models.len(), 1);
         assert_eq!(config.models[0].mode(), ModelMode::SelfExec);
@@ -761,21 +761,21 @@ kind = "gemini"
             "HOME" => Some("/home/u".to_string()),
             _ => None,
         });
-        assert_eq!(path, PathBuf::from("/xdg/herdr-openai-server/config.toml"));
+        assert_eq!(path, PathBuf::from("/xdg/herdr-openai-gateway/config.toml"));
         let path = default_config_path(|key| match key {
             "HOME" => Some("/home/u".to_string()),
             _ => None,
         });
         assert_eq!(
             path,
-            PathBuf::from("/home/u/.config/herdr-openai-server/config.toml")
+            PathBuf::from("/home/u/.config/herdr-openai-gateway/config.toml")
         );
     }
 
     #[test]
     fn load_missing_explicit_path_is_an_error() {
         let err = Config::load(Some(Path::new(
-            "/nonexistent/herdr-openai-server-config.toml",
+            "/nonexistent/herdr-openai-gateway-config.toml",
         )))
         .expect_err("missing explicit path must fail");
         assert!(matches!(err, ConfigError::Io { .. }), "got {err}");
@@ -784,7 +784,7 @@ kind = "gemini"
     #[test]
     fn load_explicit_file_parses() {
         let dir =
-            std::env::temp_dir().join(format!("herdr-openai-server-cfg-{}", std::process::id()));
+            std::env::temp_dir().join(format!("herdr-openai-gateway-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let path = dir.join("config.toml");
         std::fs::write(&path, "[server]\nlisten = \"127.0.0.1:1234\"\n").expect("write config");

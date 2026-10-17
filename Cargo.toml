@@ -1,12 +1,12 @@
 [package]
-name = "herdr-openai-server"
+name = "herdr-openai-gateway"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "OpenAI-compatible API that drives agent CLIs running inside herdr panes"
 
 [[bin]]
-name = "herdr-openai-server"
+name = "herdr-openai-gateway"
 path = "src/main.rs"
 
 # Standalone workspace root; this crate must not join the herdr workspace.

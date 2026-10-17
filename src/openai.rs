@@ -517,7 +517,7 @@ pub fn model_list(models: impl IntoIterator<Item = (String, String)>, created: u
                 description,
                 object: "model",
                 created,
-                owned_by: "herdr-openai-server",
+                owned_by: "herdr-openai-gateway",
             })
             .collect(),
     }
@@ -852,7 +852,7 @@ mod tests {
         let value = serde_json::to_value(&list).expect("serializes");
         assert_eq!(value["object"], "list");
         assert_eq!(value["data"][0]["object"], "model");
-        assert_eq!(value["data"][0]["owned_by"], "herdr-openai-server");
+        assert_eq!(value["data"][0]["owned_by"], "herdr-openai-gateway");
         assert_eq!(value["data"][0]["created"], 1_700_000_000);
         assert_eq!(value["data"][1]["id"], "codex");
         assert_eq!(value["data"][0]["description"], "Claude tools description");

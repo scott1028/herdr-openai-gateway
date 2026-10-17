@@ -63,7 +63,7 @@ impl SocketHerdr {
         guard: Option<Duration>,
     ) -> Result<serde_json::Value, HerdrError> {
         let id = format!(
-            "herdr-openai-server-{}",
+            "herdr-openai-gateway-{}",
             REQUEST_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         let envelope = RequestEnvelope {

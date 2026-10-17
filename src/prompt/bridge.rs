@@ -16,7 +16,7 @@ pub struct BridgeChanges {
     pub tools_changed: bool,
 }
 
-const PROTOCOL_PREAMBLE: &str = "[herdr-openai-server bridge protocol v1]\nYou are the language model behind another coding tool (\"the client\"). Do not use any tools of your own;\nthe client executes tools for you.";
+const PROTOCOL_PREAMBLE: &str = "[herdr-openai-gateway bridge protocol v1]\nYou are the language model behind another coding tool (\"the client\"). Do not use any tools of your own;\nthe client executes tools for you.";
 
 const PROTOCOL_RULES: &str = "## Output protocol (strict)\nReply with EITHER plain text/markdown, OR optional short text followed by exactly one block:\n\
 <tool_calls>\n[{\"name\":\"<tool>\",\"arguments\":{...}}]\n</tool_calls>\n\
@@ -306,7 +306,7 @@ mod tests {
         ]);
         r.tools = vec![tool("read")];
         let prompt = bridge_first_prompt(&r, false);
-        assert!(prompt.starts_with("[herdr-openai-server bridge protocol v1]"));
+        assert!(prompt.starts_with("[herdr-openai-gateway bridge protocol v1]"));
         assert!(prompt.contains(
             "## Client instructions\n<client_system>\nYou are helpful.\n</client_system>"
         ));

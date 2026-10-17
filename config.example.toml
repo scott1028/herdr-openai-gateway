@@ -1,7 +1,7 @@
-# herdr-openai-server configuration example.
+# herdr-openai-gateway configuration example.
 #
 # Every option is listed with its default value, so this file changes nothing.
-# Copy it to ~/.config/herdr-openai-server/config.toml (or $XDG_CONFIG_HOME/herdr-openai-server/config.toml)
+# Copy it to ~/.config/herdr-openai-gateway/config.toml (or $XDG_CONFIG_HOME/herdr-openai-gateway/config.toml)
 # and edit. A config file is optional: with no file at all the built-in defaults
 # below are used. Unknown keys are rejected.
 
@@ -11,7 +11,7 @@
 listen = "127.0.0.1:8787"
 # Name of the environment variable holding the API key clients must send in
 # `Authorization: Bearer <key>`. Empty or unset means no key is required.
-api_key_env = "HERDR_OPENAI_SERVER_API_KEY"
+api_key_env = "HERDR_OPENAI_GATEWAY_API_KEY"
 # Allow non-loopback Host/Origin headers. Only set this behind your own proxy
 # or VPN. Requires an API key in api_key_env: startup is refused without one,
 # even on a loopback bind.

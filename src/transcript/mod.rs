@@ -102,7 +102,9 @@ mod tests {
     #[test]
     fn cursor_missing_file_is_empty() {
         let mut cursor = JsonlCursor {
-            path: Some(PathBuf::from("/nonexistent/herdr-openai-server-test.jsonl")),
+            path: Some(PathBuf::from(
+                "/nonexistent/herdr-openai-gateway-test.jsonl",
+            )),
             ..JsonlCursor::default()
         };
         assert_eq!(cursor.read_new_lines().expect("io"), Vec::<String>::new());
@@ -111,7 +113,7 @@ mod tests {
     #[test]
     fn cursor_follows_appends_and_keeps_partial_line() {
         let dir = std::env::temp_dir().join(format!(
-            "herdr-openai-server-cursor-{}-{}",
+            "herdr-openai-gateway-cursor-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -144,7 +146,7 @@ mod tests {
     #[test]
     fn cursor_keeps_multibyte_char_split_across_appends() {
         let dir = std::env::temp_dir().join(format!(
-            "herdr-openai-server-cjk-{}-{}",
+            "herdr-openai-gateway-cjk-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

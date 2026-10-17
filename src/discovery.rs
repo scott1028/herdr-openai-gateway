@@ -42,14 +42,14 @@ pub struct Candidate {
     pub body: String,
 }
 
-const MARKER: &str = "@@herdr-openai-server@@";
+const MARKER: &str = "@@herdr-openai-gateway@@";
 
 /// Bash script: marker line per matching name, then its definition.
 const BASH_SCRIPT: &str = r#"for name in $(compgen -A function -A alias -A command | grep -E '^(claude|codex)(-[A-Za-z0-9._-]+)?$' | sort -u); do
   case "$(type -t "$name" 2>/dev/null)" in
-    function) printf '@@herdr-openai-server@@ %s function\n' "$name"; declare -f "$name" ;;
-    alias) printf '@@herdr-openai-server@@ %s alias\n' "$name"; alias "$name" ;;
-    file) printf '@@herdr-openai-server@@ %s file\n' "$name" ;;
+    function) printf '@@herdr-openai-gateway@@ %s function\n' "$name"; declare -f "$name" ;;
+    alias) printf '@@herdr-openai-gateway@@ %s alias\n' "$name"; alias "$name" ;;
+    file) printf '@@herdr-openai-gateway@@ %s file\n' "$name" ;;
   esac
 done"#;
 
@@ -57,9 +57,9 @@ done"#;
 const ZSH_SCRIPT: &str = r#"for name in ${(k)functions} ${(k)aliases} ${(k)commands}; do
   [[ $name =~ '^(claude|codex)(-[A-Za-z0-9._-]+)?$' ]] || continue
   case "$(whence -w "$name" 2>/dev/null)" in
-    *:function) printf '@@herdr-openai-server@@ %s function\n' "$name"; print -r -- "${functions[$name]}" ;;
-    *:alias) printf '@@herdr-openai-server@@ %s alias\n' "$name"; alias "$name" ;;
-    *:command) printf '@@herdr-openai-server@@ %s file\n' "$name" ;;
+    *:function) printf '@@herdr-openai-gateway@@ %s function\n' "$name"; print -r -- "${functions[$name]}" ;;
+    *:alias) printf '@@herdr-openai-gateway@@ %s alias\n' "$name"; alias "$name" ;;
+    *:command) printf '@@herdr-openai-gateway@@ %s file\n' "$name" ;;
   esac
 done"#;
 
@@ -474,12 +474,12 @@ mod tests {
         let output = "\
 Last login on the console
 some banner text
-@@herdr-openai-server@@ claude file
-@@herdr-openai-server@@ claude function
+@@herdr-openai-gateway@@ claude file
+@@herdr-openai-gateway@@ claude function
 claude () {
   command claude \"$@\"
 }
-@@herdr-openai-server@@ codex alias
+@@herdr-openai-gateway@@ codex alias
 alias codex='command codex --profile x'
 ";
         let candidates = parse_candidates(output);
@@ -686,7 +686,7 @@ alias codex='command codex --profile x'
     #[test]
     fn codex_integration_warnings_point_at_the_missing_home() {
         let dir = std::env::temp_dir().join(format!(
-            "herdr-openai-server-disc-{}-{}",
+            "herdr-openai-gateway-disc-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -755,7 +755,7 @@ alias codex='command codex --profile x'
     #[tokio::test]
     async fn discover_runs_a_real_bash_with_a_temp_home() {
         let home = std::env::temp_dir().join(format!(
-            "herdr-openai-server-disc-home-{}-{}",
+            "herdr-openai-gateway-disc-home-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

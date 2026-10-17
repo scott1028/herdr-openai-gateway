@@ -875,7 +875,7 @@ impl<H: HerdrApi> Service<H> {
                 hook_answer_not_delivered(&tab_label)
             } else {
                 explanatory(
-                    "[herdr-openai-server] That question expired before it was answered. Send your \
+                    "[herdr-openai-gateway] That question expired before it was answered. Send your \
                      message again."
                         .to_string(),
                 )
@@ -1286,7 +1286,7 @@ impl<H: HerdrApi> Service<H> {
                     ),
                 ];
                 extras.env.insert(
-                    "HERDR_OPENAI_SERVER_HOOK_TOKEN".to_string(),
+                    "HERDR_OPENAI_GATEWAY_HOOK_TOKEN".to_string(),
                     hook.token.clone(),
                 );
             }
@@ -2115,7 +2115,7 @@ impl<H: HerdrApi> Service<H> {
             // Non-error outcomes are committed like normal replies so a client
             // retry finds them in the Retry cache instead of re-prompting the agent.
             Ok(TurnOutcome::Aborted { reason }) => explanatory(format!(
-                "[herdr-openai-server] The backing agent's turn was interrupted ({reason}). \
+                "[herdr-openai-gateway] The backing agent's turn was interrupted ({reason}). \
                  Send your message again to continue."
             )),
             Ok(TurnOutcome::BlockedTimeout) => {
@@ -2123,14 +2123,14 @@ impl<H: HerdrApi> Service<H> {
                 // marked expired, so a late answer gets the explanatory reply.
                 self.locked_registry().expire_dialog(id);
                 explanatory(format!(
-                    "[herdr-openai-server] The backing agent {} (herdr workspace {}, tab {}) is \
+                    "[herdr-openai-gateway] The backing agent {} (herdr workspace {}, tab {}) is \
                      waiting for approval. Approve or deny it in herdr, then send your \
                      message again.",
                     agent.name, self.config.herdr.workspace_label, agent.tab_label,
                 ))
             }
             Ok(TurnOutcome::UpstreamError { message }) => explanatory(format!(
-                "[herdr-openai-server] The backing agent reported an upstream error: {message}"
+                "[herdr-openai-gateway] The backing agent reported an upstream error: {message}"
             )),
             Err(turn_error) => return Err(turn_error.into_api_error()),
         };
@@ -2507,7 +2507,7 @@ fn is_loopback_peer(ip: std::net::IpAddr) -> bool {
 
 fn hook_answer_not_delivered(tab_label: &str) -> AssistantReply {
     explanatory(format!(
-        "[herdr-openai-server] Claude stopped waiting for this question before your answer arrived, so the answer was not delivered (for example, its session in herdr tab {tab_label} was interrupted or moved to the background). Check that tab, or send a new message to continue."
+        "[herdr-openai-gateway] Claude stopped waiting for this question before your answer arrived, so the answer was not delivered (for example, its session in herdr tab {tab_label} was interrupted or moved to the background). Check that tab, or send a new message to continue."
     ))
 }
 
@@ -2547,7 +2547,7 @@ mod tests {
             use std::os::unix::fs::symlink;
 
             let root = std::env::temp_dir().join(format!(
-                "herdr-openai-server-client-proc-{}-{}",
+                "herdr-openai-gateway-client-proc-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -2645,7 +2645,7 @@ mod tests {
     impl Fixture {
         fn new(config: Config, fake: FakeHerdr) -> Self {
             let dir = std::env::temp_dir().join(format!(
-                "herdr-openai-server-svc-{}-{}",
+                "herdr-openai-gateway-svc-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -2810,7 +2810,7 @@ mod tests {
 
     fn expected_cancelled_hook_reply(tab_label: &str) -> String {
         format!(
-            "[herdr-openai-server] Claude stopped waiting for this question before your answer arrived, so the answer was not delivered (for example, its session in herdr tab {tab_label} was interrupted or moved to the background). Check that tab, or send a new message to continue."
+            "[herdr-openai-gateway] Claude stopped waiting for this question before your answer arrived, so the answer was not delivered (for example, its session in herdr tab {tab_label} was interrupted or moved to the background). Check that tab, or send a new message to continue."
         )
     }
 
@@ -2988,7 +2988,7 @@ mod tests {
         assert_eq!(outcome.reply.tool_calls[0].function.name, "read");
         assert!(outcome.reply.tool_calls[0].id.starts_with("call_"));
         let prompt = prompt_calls(&f.fake)[0].clone();
-        assert!(prompt.contains("[herdr-openai-server bridge protocol v1]"));
+        assert!(prompt.contains("[herdr-openai-gateway bridge protocol v1]"));
         assert!(prompt.contains("<tools>"));
 
         let err = f
@@ -3043,7 +3043,7 @@ mod tests {
             .iter()
             .find(|call| call.method == "tab.create")
             .expect("tab.create");
-        assert_eq!(tab.param("env.HERDR_OPENAI_SERVER_HOOK_TOKEN"), None);
+        assert_eq!(tab.param("env.HERDR_OPENAI_GATEWAY_HOOK_TOKEN"), None);
         assert_eq!(tab.param("env.CLAUDE_CODE_DISABLE_AGENT_VIEW"), None);
         f.cleanup();
     }

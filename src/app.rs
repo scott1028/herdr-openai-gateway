@@ -166,7 +166,7 @@ pub async fn serve(args: ServeArgs) -> ExitCode {
             }
         }
     });
-    tracing::info!("herdr-openai-server listening on http://{listen_addr}");
+    tracing::info!("herdr-openai-gateway listening on http://{listen_addr}");
     let shutdown_service = Arc::clone(&service);
     let result = axum::serve(
         listener,
@@ -307,7 +307,7 @@ mod tests {
     #[tokio::test]
     async fn serve_exits_when_herdr_is_unreachable_at_startup() {
         let dir = std::env::temp_dir().join(format!(
-            "herdr-openai-server-serve-{}-{}",
+            "herdr-openai-gateway-serve-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

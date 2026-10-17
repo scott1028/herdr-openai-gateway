@@ -457,7 +457,7 @@ mod tests {
     #[test]
     fn roots_prefer_model_env_then_process_env_then_home() {
         let dir = std::env::temp_dir().join(format!(
-            "herdr-openai-server-roots-{}-{}",
+            "herdr-openai-gateway-roots-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -503,7 +503,7 @@ mod tests {
     #[test]
     fn locate_rejects_path_like_session_ids() {
         let dir = std::env::temp_dir().join(format!(
-            "herdr-openai-server-claude-ids-{}-{}",
+            "herdr-openai-gateway-claude-ids-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

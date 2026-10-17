@@ -4,12 +4,12 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use herdr_openai_server::app::{self, ServeArgs};
-use herdr_openai_server::herdr::{self, HerdrApi as _, SocketFlags};
+use herdr_openai_gateway::app::{self, ServeArgs};
+use herdr_openai_gateway::herdr::{self, HerdrApi as _, SocketFlags};
 
 #[derive(Parser)]
 #[command(
-    name = "herdr-openai-server",
+    name = "herdr-openai-gateway",
     about = "OpenAI-compatible API backed by agent CLIs running inside herdr panes",
     version
 )]
@@ -22,7 +22,7 @@ struct Cli {
 enum Command {
     /// Serve the OpenAI-compatible API
     Serve {
-        /// Path to config.toml (defaults to $XDG_CONFIG_HOME/herdr-openai-server/config.toml)
+        /// Path to config.toml (defaults to $XDG_CONFIG_HOME/herdr-openai-gateway/config.toml)
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
         /// Listen address, overrides server.listen from the config
@@ -79,9 +79,9 @@ async fn main() -> ExitCode {
             herdr_session,
             herdr_socket,
         } => {
-            let config = herdr_openai_server::config::Config::load(None).unwrap_or_else(|err| {
+            let config = herdr_openai_gateway::config::Config::load(None).unwrap_or_else(|err| {
                 println!("config: {err}; using built-in defaults");
-                herdr_openai_server::config::Config::builtin()
+                herdr_openai_gateway::config::Config::builtin()
             });
             let flags = SocketFlags {
                 socket: herdr_socket,
@@ -100,7 +100,7 @@ async fn main() -> ExitCode {
                     false
                 }
             };
-            let discovery = herdr_openai_server::discovery::discover(&config.discovery, |key| {
+            let discovery = herdr_openai_gateway::discovery::discover(&config.discovery, |key| {
                 std::env::var(key).ok()
             })
             .await;
@@ -114,7 +114,7 @@ async fn main() -> ExitCode {
             }
             let home = std::env::var("HOME").unwrap_or_default();
             for warning in discovery.warnings.iter().chain(
-                herdr_openai_server::discovery::codex_integration_warnings(
+                herdr_openai_gateway::discovery::codex_integration_warnings(
                     &discovery.variants,
                     &home,
                 )
