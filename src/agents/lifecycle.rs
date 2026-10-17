@@ -7,11 +7,20 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::config::{AgentKind, ModelSpec};
-use crate::herdr::{AgentStart, AgentStatus, HerdrApi, HerdrError, ReadSource, TabCreate};
+use crate::herdr::{
+    AgentStart, AgentStatus, HerdrApi, HerdrError, PaneInfo, ReadSource, TabCreate, TabInfo,
+};
 use crate::openai::ApiError;
 
 /// Tab labels owned by herdr-openai-server start with this prefix; nothing else is ever closed.
 pub const TAB_LABEL_PREFIX: &str = "oa:";
+/// `pane.report_metadata` source for the owner token.
+pub const OWNER_TOKEN_SOURCE: &str = "herdr-openai-server";
+/// Pane token naming the server instance that owns a backing tab; tabs another
+/// live instance owns are never closed.
+pub const OWNER_TOKEN_KEY: &str = "oa_owner";
+/// Owner token lifetime: three reaper ticks, so one missed refresh keeps it.
+pub const OWNER_TOKEN_TTL_MS: u64 = 90_000;
 
 const PANE_BUSY_RETRY: Duration = Duration::from_millis(100);
 const PANE_BUSY_WINDOW: Duration = Duration::from_secs(5);
@@ -169,21 +178,31 @@ pub async fn ensure_workspace<H: HerdrApi>(h: &H, label: &str) -> Result<String,
     Ok(created.workspace.workspace_id)
 }
 
-/// Launch a backing agent: create the tab and start the process. The returned
-/// handle has `ready = false`; call [`await_ready`] before prompting it.
+/// Per-launch additions on top of the model spec.
+#[derive(Debug, Default)]
+pub struct LaunchExtras {
+    /// Appended after the model's args.
+    pub args: Vec<String>,
+    /// Added to the tab env over the model's env.
+    pub env: BTreeMap<String, String>,
+}
+
+/// Launch a backing agent: create the tab, tag its pane with `owner_id`, and
+/// start the process. The returned handle has `ready = false`; call
+/// [`await_ready`] before prompting it.
 pub async fn launch_agent<H: HerdrApi>(
     h: &H,
     workspace_id: &str,
     model: &ModelSpec,
     cwd: &Path,
     startup_timeout_ms: u64,
-    extra_args: &[String],
-    extra_env: &BTreeMap<String, String>,
+    extras: &LaunchExtras,
+    owner_id: &str,
 ) -> Result<AgentHandle, SpawnError> {
     let suffix = random_suffix_hex();
     let label = tab_label(&model.id, &suffix);
     let mut env = model.env.clone();
-    env.extend(extra_env.clone());
+    env.extend(extras.env.clone());
     let created = h
         .tab_create(TabCreate {
             workspace_id,
@@ -196,6 +215,11 @@ pub async fn launch_agent<H: HerdrApi>(
         .map_err(SpawnError::Herdr)?;
     let tab_id = created.tab.tab_id.clone();
     let pane_id = created.root_pane.pane_id.clone();
+    // An untagged tab looks like an orphan to sweeps, so tag it first.
+    if let Err(err) = report_owner_token(h, &pane_id, owner_id).await {
+        close_backing_tab(h, &tab_id).await;
+        return Err(SpawnError::Herdr(err));
+    }
 
     let (session_id, kind_args) = match model.kind {
         AgentKind::Claude => {
@@ -205,7 +229,7 @@ pub async fn launch_agent<H: HerdrApi>(
         AgentKind::Codex => (None, Vec::new()),
     };
     let mut args = model.args.clone();
-    args.extend_from_slice(extra_args);
+    args.extend_from_slice(&extras.args);
     args.extend(kind_args);
 
     let base = model.kind.herdr_label();
@@ -496,6 +520,7 @@ pub async fn spawn_agent<H: HerdrApi>(
     model: &ModelSpec,
     cwd: &Path,
     startup_timeout_ms: u64,
+    owner_id: &str,
 ) -> Result<AgentHandle, SpawnError> {
     let mut handle = launch_agent(
         h,
@@ -503,8 +528,8 @@ pub async fn spawn_agent<H: HerdrApi>(
         model,
         cwd,
         startup_timeout_ms,
-        &[],
-        &BTreeMap::new(),
+        &LaunchExtras::default(),
+        owner_id,
     )
     .await?;
     await_ready(h, &mut handle, startup_timeout_ms).await?;
@@ -515,9 +540,35 @@ async fn close_backing_tab<H: HerdrApi>(h: &H, tab_id: &str) {
     let _ = h.tab_close(tab_id).await;
 }
 
+/// Report `oa_owner = owner_id` on a pane with the owner token TTL.
+pub(crate) async fn report_owner_token<H: HerdrApi>(
+    h: &H,
+    pane_id: &str,
+    owner_id: &str,
+) -> Result<(), HerdrError> {
+    let tokens = BTreeMap::from([(OWNER_TOKEN_KEY.to_string(), owner_id.to_string())]);
+    h.pane_report_tokens(
+        pane_id,
+        OWNER_TOKEN_SOURCE,
+        &tokens,
+        Some(OWNER_TOKEN_TTL_MS),
+    )
+    .await
+}
+
+/// Owner token values on the panes of one tab.
+fn tab_owners<'a>(panes: &'a [PaneInfo], tab_id: &str) -> Vec<&'a str> {
+    panes
+        .iter()
+        .filter(|pane| pane.tab_id == tab_id)
+        .filter_map(|pane| pane.tokens.get(OWNER_TOKEN_KEY))
+        .map(String::as_str)
+        .collect()
+}
+
 /// Best-effort close: refresh the tab via `agent.get`, then close it only when the
-/// label is ours.
-pub async fn close_agent<H: HerdrApi>(h: &H, agent: &AgentHandle) {
+/// label is ours and no other instance owns it.
+pub async fn close_agent<H: HerdrApi>(h: &H, agent: &AgentHandle, owner_id: &str) {
     let mut tab_id = agent.tab_id.clone();
     let mut workspace_id = agent.workspace_id.clone();
     match h.agent_get(&agent.name).await {
@@ -528,10 +579,10 @@ pub async fn close_agent<H: HerdrApi>(h: &H, agent: &AgentHandle) {
         Err(HerdrError::Api { code, .. }) if code == "agent_not_found" => {}
         Err(err) => tracing::warn!(name = %agent.name, "agent.get failed during close: {err}"),
     }
-    close_tab_if_ours(h, &workspace_id, &tab_id).await;
+    close_tab_if_ours(h, &workspace_id, &tab_id, owner_id).await;
 }
 
-async fn close_tab_if_ours<H: HerdrApi>(h: &H, workspace_id: &str, tab_id: &str) {
+async fn close_tab_if_ours<H: HerdrApi>(h: &H, workspace_id: &str, tab_id: &str, owner_id: &str) {
     let tabs = match h.tab_list(workspace_id).await {
         Ok(tabs) => tabs,
         Err(err) => {
@@ -545,23 +596,104 @@ async fn close_tab_if_ours<H: HerdrApi>(h: &H, workspace_id: &str, tab_id: &str)
     if !tab.label.starts_with(TAB_LABEL_PREFIX) {
         return;
     }
+    // A missing token (never reported, or expired) still allows the close.
+    let panes = match h.pane_list(workspace_id).await {
+        Ok(panes) => panes,
+        Err(err) => {
+            tracing::warn!(tab_id, "pane.list failed during close: {err}");
+            return;
+        }
+    };
+    if let Some(owner) = tab_owners(&panes, tab_id)
+        .into_iter()
+        .find(|owner| *owner != owner_id)
+    {
+        tracing::info!(
+            tab_id,
+            owner,
+            "not closing a backing tab another instance owns"
+        );
+        return;
+    }
     if let Err(err) = h.tab_close(tab_id).await {
         tracing::warn!(tab_id, "tab.close failed: {err}");
     }
 }
 
-/// Close leftover backing-agent tabs in the workspace; returns how many were closed.
-pub async fn sweep_orphans<H: HerdrApi>(h: &H, workspace_id: &str) -> usize {
-    let Ok(tabs) = h.tab_list(workspace_id).await else {
+/// `oa:` tabs of one workspace, split by the owner tokens on their panes.
+#[derive(Debug, Default)]
+pub struct OwnerScan {
+    /// No pane carries an owner token.
+    pub untagged: Vec<TabInfo>,
+    /// A pane carries another instance's token.
+    pub foreign: Vec<TabInfo>,
+}
+
+/// List the workspace's `oa:` tabs that are untagged or owned by another instance;
+/// tabs carrying only `owner_id` are in neither list.
+pub async fn scan_owner_tokens<H: HerdrApi>(
+    h: &H,
+    workspace_id: &str,
+    owner_id: &str,
+) -> Result<OwnerScan, HerdrError> {
+    let tabs = h.tab_list(workspace_id).await?;
+    let panes = h.pane_list(workspace_id).await?;
+    let mut scan = OwnerScan::default();
+    for tab in tabs {
+        if !tab.label.starts_with(TAB_LABEL_PREFIX) {
+            continue;
+        }
+        let owners = tab_owners(&panes, &tab.tab_id);
+        if owners.is_empty() {
+            scan.untagged.push(tab);
+        } else if owners.iter().any(|owner| *owner != owner_id) {
+            scan.foreign.push(tab);
+        }
+    }
+    Ok(scan)
+}
+
+/// Close leftover backing-agent tabs that no instance owns; returns how many were
+/// closed. Tabs another instance owns are logged and kept.
+pub async fn sweep_orphans<H: HerdrApi>(h: &H, workspace_id: &str, owner_id: &str) -> usize {
+    let Ok(scan) = scan_owner_tokens(h, workspace_id, owner_id).await else {
         return 0;
     };
+    for tab in &scan.foreign {
+        tracing::info!(
+            tab_id = %tab.tab_id,
+            label = %tab.label,
+            "keeping a backing tab another instance owns"
+        );
+    }
     let mut closed = 0;
-    for tab in tabs {
-        if tab.label.starts_with(TAB_LABEL_PREFIX) && h.tab_close(&tab.tab_id).await.is_ok() {
+    for tab in scan.untagged {
+        if h.tab_close(&tab.tab_id).await.is_ok() {
             closed += 1;
         }
     }
     closed
+}
+
+/// Re-report the owner token, with a fresh TTL, on every pane `owner_id` owns.
+pub async fn refresh_owner_tokens<H: HerdrApi>(h: &H, workspace_id: &str, owner_id: &str) {
+    let panes = match h.pane_list(workspace_id).await {
+        Ok(panes) => panes,
+        Err(err) => {
+            tracing::warn!("pane.list failed during owner token refresh: {err}");
+            return;
+        }
+    };
+    let ours = panes.iter().filter(|pane| {
+        pane.tokens
+            .get(OWNER_TOKEN_KEY)
+            .is_some_and(|owner| owner == owner_id)
+    });
+    for pane in ours {
+        if let Err(err) = report_owner_token(h, &pane.pane_id, owner_id).await {
+            tracing::warn!(pane_id = %pane.pane_id, "owner token refresh failed: {err}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -569,6 +701,8 @@ mod tests {
     use super::*;
     use crate::herdr::fake::{FakeHerdr, StartupBehavior};
     use std::collections::BTreeMap;
+
+    const OWNER: &str = "owner-test";
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -768,6 +902,7 @@ mod tests {
             &model("claude"),
             Path::new("/tmp"),
             1000,
+            OWNER,
         )
         .await
     }
@@ -814,19 +949,21 @@ mod tests {
             "http://127.0.0.1:8787/internal/claude-hooks/pre-tool-use",
             60,
         );
-        let extra_args = vec!["--settings".to_string(), settings.clone()];
-        let extra_env = BTreeMap::from([(
-            "HERDR_OPENAI_SERVER_HOOK_TOKEN".to_string(),
-            "secret-value".to_string(),
-        )]);
+        let extras = LaunchExtras {
+            args: vec!["--settings".to_string(), settings.clone()],
+            env: BTreeMap::from([(
+                "HERDR_OPENAI_SERVER_HOOK_TOKEN".to_string(),
+                "secret-value".to_string(),
+            )]),
+        };
         launch_agent(
             &fake,
             &workspace_id,
             &model("claude"),
             Path::new("/tmp"),
             1000,
-            &extra_args,
-            &extra_env,
+            &extras,
+            OWNER,
         )
         .await
         .expect("launch");
@@ -862,19 +999,21 @@ mod tests {
             "http://127.0.0.1:8787/internal/claude-hooks/pre-tool-use",
             60,
         );
-        let extra_args = vec!["--settings".to_string(), settings];
-        let extra_env = BTreeMap::from([(
-            "HERDR_OPENAI_SERVER_HOOK_TOKEN".to_string(),
-            "secret-value".to_string(),
-        )]);
+        let extras = LaunchExtras {
+            args: vec!["--settings".to_string(), settings],
+            env: BTreeMap::from([(
+                "HERDR_OPENAI_SERVER_HOOK_TOKEN".to_string(),
+                "secret-value".to_string(),
+            )]),
+        };
         launch_agent(
             &fake,
             &workspace_id,
             &model,
             Path::new("/tmp"),
             1000,
-            &extra_args,
-            &extra_env,
+            &extras,
+            OWNER,
         )
         .await
         .expect("launch");
@@ -1001,10 +1140,11 @@ mod tests {
             &model("claude"),
             Path::new("/tmp"),
             1000,
+            OWNER,
         )
         .await
         .expect("spawn");
-        close_agent(&fake, &handle).await;
+        close_agent(&fake, &handle, OWNER).await;
         let labels = fake.tab_labels(&workspace_id);
         assert!(labels.contains(&"lobby".to_string()));
         assert!(labels.contains(&"user-tab".to_string()));
@@ -1029,12 +1169,176 @@ mod tests {
             .await
             .expect("tab");
         }
-        let closed = sweep_orphans(&fake, &workspace_id).await;
+        let closed = sweep_orphans(&fake, &workspace_id, OWNER).await;
         assert_eq!(closed, 2);
         let labels = fake.tab_labels(&workspace_id);
         assert!(labels.contains(&"lobby".to_string()));
         assert!(labels.contains(&"keep-me".to_string()));
         assert!(!labels.iter().any(|l| l.starts_with(TAB_LABEL_PREFIX)));
+    }
+
+    /// An `oa:`-style tab created outside `launch_agent`, optionally tagged with `owner`.
+    async fn seed_tab(
+        fake: &FakeHerdr,
+        workspace_id: &str,
+        label: &str,
+        owner: Option<&str>,
+    ) -> crate::herdr::TabCreated {
+        let created = fake
+            .tab_create(TabCreate {
+                workspace_id,
+                cwd: None,
+                label: Some(label),
+                env: &BTreeMap::new(),
+                focus: false,
+            })
+            .await
+            .expect("tab");
+        if let Some(owner) = owner {
+            let tokens = BTreeMap::from([(OWNER_TOKEN_KEY.to_string(), owner.to_string())]);
+            fake.pane_report_tokens(&created.root_pane.pane_id, "test", &tokens, None)
+                .await
+                .expect("tag pane");
+        }
+        created
+    }
+
+    fn token_reports(fake: &FakeHerdr) -> Vec<crate::herdr::fake::FakeCall> {
+        fake.calls()
+            .into_iter()
+            .filter(|c| c.method == "pane.report_metadata")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn launch_tags_the_root_pane_before_starting_the_agent() {
+        let fake = FakeHerdr::new();
+        let handle = spawn_in_fake(&fake).await.expect("spawn");
+        let reports = token_reports(&fake);
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0];
+        assert_eq!(report.param("pane_id"), Some(handle.pane_id.as_str()));
+        assert_eq!(report.param("source"), Some(OWNER_TOKEN_SOURCE));
+        assert_eq!(report.param("token.oa_owner"), Some(OWNER));
+        assert_eq!(report.param("ttl_ms"), Some("90000"));
+
+        let methods: Vec<&str> = fake.calls().iter().map(|c| c.method).collect();
+        let report_at = methods.iter().position(|m| *m == "pane.report_metadata");
+        let start_at = methods.iter().position(|m| *m == "agent.start");
+        assert!(report_at < start_at, "tag before start: {methods:?}");
+
+        let panes = fake.pane_list(&handle.workspace_id).await.expect("panes");
+        let pane = panes
+            .iter()
+            .find(|pane| pane.pane_id == handle.pane_id)
+            .expect("agent pane");
+        assert_eq!(
+            pane.tokens.get(OWNER_TOKEN_KEY).map(String::as_str),
+            Some(OWNER)
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_closes_the_tab_when_the_token_report_fails() {
+        let fake = FakeHerdr::new().with_report_tokens_fails();
+        let err = spawn_in_fake(&fake).await.expect_err("token report fails");
+        assert!(matches!(err, SpawnError::Herdr(_)), "got {err:?}");
+        assert_eq!(fake.tab_labels("w1"), vec!["lobby".to_string()]);
+        assert!(!fake.calls().iter().any(|c| c.method == "agent.start"));
+    }
+
+    #[tokio::test]
+    async fn close_agent_respects_owner_tokens() {
+        let fake = FakeHerdr::new();
+        let workspace_id = ensure_workspace(&fake, "openai-api").await.expect("ws");
+        let claude = model("claude");
+        let launch = |owner: &'static str| {
+            spawn_agent(
+                &fake,
+                &workspace_id,
+                &claude,
+                Path::new("/tmp"),
+                1000,
+                owner,
+            )
+        };
+        let foreign = launch("other-instance").await.expect("foreign spawn");
+        let ours = launch(OWNER).await.expect("our spawn");
+        let untagged = seed_tab(&fake, &workspace_id, "oa:claude:cccccc", None).await;
+        let untagged_handle = AgentHandle {
+            name: "oa-claude-cccccc".to_string(),
+            tab_id: untagged.tab.tab_id.clone(),
+            tab_label: "oa:claude:cccccc".to_string(),
+            pane_id: untagged.root_pane.pane_id.clone(),
+            ..ours.clone()
+        };
+
+        close_agent(&fake, &foreign, OWNER).await;
+        close_agent(&fake, &ours, OWNER).await;
+        close_agent(&fake, &untagged_handle, OWNER).await;
+
+        let labels = fake.tab_labels(&workspace_id);
+        assert_eq!(labels, vec!["lobby".to_string(), foreign.tab_label.clone()]);
+        assert!(
+            !fake
+                .calls()
+                .iter()
+                .any(|c| c.method == "tab.close"
+                    && c.param("tab_id") == Some(foreign.tab_id.as_str()))
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_orphans_respects_owner_tokens() {
+        let fake = FakeHerdr::new();
+        let workspace_id = ensure_workspace(&fake, "openai-api").await.expect("ws");
+        seed_tab(&fake, &workspace_id, "oa:claude:aaaaaa", None).await;
+        let foreign = seed_tab(&fake, &workspace_id, "oa:claude:bbbbbb", Some("other")).await;
+        seed_tab(&fake, &workspace_id, "oa:claude:dddddd", Some(OWNER)).await;
+        let user = seed_tab(&fake, &workspace_id, "keep-me", None).await;
+
+        let closed = sweep_orphans(&fake, &workspace_id, OWNER).await;
+        assert_eq!(closed, 1);
+        assert_eq!(
+            fake.tab_labels(&workspace_id),
+            vec![
+                "lobby".to_string(),
+                "oa:claude:bbbbbb".to_string(),
+                "oa:claude:dddddd".to_string(),
+                "keep-me".to_string(),
+            ]
+        );
+        let closes: Vec<String> = fake
+            .calls()
+            .iter()
+            .filter(|c| c.method == "tab.close")
+            .filter_map(|c| c.param("tab_id").map(String::from))
+            .collect();
+        assert!(!closes.contains(&foreign.tab.tab_id));
+        assert!(!closes.contains(&user.tab.tab_id));
+    }
+
+    #[tokio::test]
+    async fn refresh_owner_tokens_reports_only_our_panes() {
+        let fake = FakeHerdr::new();
+        let workspace_id = ensure_workspace(&fake, "openai-api").await.expect("ws");
+        let ours = seed_tab(&fake, &workspace_id, "oa:claude:aaaaaa", Some(OWNER)).await;
+        seed_tab(&fake, &workspace_id, "oa:claude:bbbbbb", Some("other")).await;
+        seed_tab(&fake, &workspace_id, "oa:claude:cccccc", None).await;
+        let before = token_reports(&fake).len();
+
+        refresh_owner_tokens(&fake, &workspace_id, OWNER).await;
+
+        let reports = token_reports(&fake);
+        let refreshed = &reports[before..];
+        assert_eq!(refreshed.len(), 1, "{refreshed:?}");
+        assert_eq!(
+            refreshed[0].param("pane_id"),
+            Some(ours.root_pane.pane_id.as_str())
+        );
+        assert_eq!(refreshed[0].param("source"), Some(OWNER_TOKEN_SOURCE));
+        assert_eq!(refreshed[0].param("token.oa_owner"), Some(OWNER));
+        assert_eq!(refreshed[0].param("ttl_ms"), Some("90000"));
     }
 
     #[test]
@@ -1061,7 +1365,7 @@ mod tests {
         model: &ModelSpec,
     ) -> Result<AgentHandle, SpawnError> {
         let workspace_id = ensure_workspace(fake, "openai-api").await.expect("ws");
-        spawn_agent(fake, &workspace_id, model, Path::new("/tmp"), 10_000).await
+        spawn_agent(fake, &workspace_id, model, Path::new("/tmp"), 10_000, OWNER).await
     }
 
     #[tokio::test(start_paused = true)]

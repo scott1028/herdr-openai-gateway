@@ -1,7 +1,7 @@
 //! In-memory `HerdrApi` double for tests: records every call, scripts agent turn
 //! outcomes, and writes synthetic Claude transcript JSONL when a reply lands.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
@@ -168,6 +168,10 @@ struct State {
     tabs: Vec<TabInfo>,
     /// `(pane_id, tab_id)` pairs created by `tab_create`.
     panes: Vec<(String, String)>,
+    /// Metadata tokens per pane id, set by `pane_report_tokens`.
+    pane_tokens: BTreeMap<String, BTreeMap<String, String>>,
+    /// Every `pane_report_tokens` call fails.
+    report_tokens_fails: bool,
     agents: Vec<FakeAgent>,
     turns: VecDeque<ScriptedTurn>,
     startup: StartupBehavior,
@@ -326,6 +330,17 @@ impl FakeHerdr {
             .variant_commands
             .push((command.to_string(), kind.to_string()));
         self
+    }
+
+    /// Every `pane.report_metadata` call fails, simulating a rejected token report.
+    pub fn with_report_tokens_fails(self) -> Self {
+        self.lock().report_tokens_fails = true;
+        self
+    }
+
+    /// Drop a pane's metadata tokens, simulating their TTL expiring.
+    pub fn clear_pane_tokens(&self, pane_id: &str) {
+        self.lock().pane_tokens.remove(pane_id);
     }
 
     /// The first `agent.rename` call fails with `agent_name_taken`.
@@ -717,6 +732,7 @@ impl HerdrApi for FakeHerdr {
                 pane_id,
                 tab_id,
                 workspace_id,
+                tokens: BTreeMap::new(),
             },
         })
     }
@@ -787,6 +803,7 @@ impl HerdrApi for FakeHerdr {
                 pane_id,
                 tab_id,
                 workspace_id: params.workspace_id.to_string(),
+                tokens: BTreeMap::new(),
             },
         })
     }
@@ -832,6 +849,78 @@ impl HerdrApi for FakeHerdr {
         state
             .workspaces
             .retain(|workspace| alive_workspaces.contains(&workspace.workspace_id));
+        Ok(())
+    }
+
+    async fn pane_list(&self, workspace_id: &str) -> Result<Vec<PaneInfo>, HerdrError> {
+        if self.lock().unavailable {
+            return Err(unavailable_error());
+        }
+        let mut state = self.lock();
+        state.calls.push(call(
+            "pane.list",
+            vec![("workspace_id", workspace_id.to_string())],
+        ));
+        // Panes of closed tabs are gone, like in real herdr.
+        Ok(state
+            .panes
+            .iter()
+            .filter(|(_, tab_id)| {
+                state
+                    .tabs
+                    .iter()
+                    .any(|tab| tab.tab_id == *tab_id && tab.workspace_id == workspace_id)
+            })
+            .map(|(pane_id, tab_id)| PaneInfo {
+                pane_id: pane_id.clone(),
+                tab_id: tab_id.clone(),
+                workspace_id: workspace_id.to_string(),
+                tokens: state.pane_tokens.get(pane_id).cloned().unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    async fn pane_report_tokens(
+        &self,
+        pane_id: &str,
+        source: &str,
+        tokens: &BTreeMap<String, String>,
+        ttl_ms: Option<u64>,
+    ) -> Result<(), HerdrError> {
+        if self.lock().unavailable {
+            return Err(unavailable_error());
+        }
+        let mut recorded = vec![
+            ("pane_id".to_string(), pane_id.to_string()),
+            ("source".to_string(), source.to_string()),
+            (
+                "ttl_ms".to_string(),
+                ttl_ms.map(|ms| ms.to_string()).unwrap_or_default(),
+            ),
+        ];
+        for (key, value) in tokens {
+            recorded.push((format!("token.{key}"), value.clone()));
+        }
+        let mut state = self.lock();
+        state.calls.push(call("pane.report_metadata", recorded));
+        if state.report_tokens_fails {
+            return Err(api_error(
+                "invalid_metadata_token",
+                "fake token report fails",
+            ));
+        }
+        let known = state.panes.iter().any(|(id, tab_id)| {
+            id == pane_id && state.tabs.iter().any(|tab| tab.tab_id == *tab_id)
+        });
+        if !known {
+            return Err(api_error("pane_not_found", "no such pane"));
+        }
+        // Tokens merge per key, like herdr's per-pane token map.
+        state
+            .pane_tokens
+            .entry(pane_id.to_string())
+            .or_default()
+            .extend(tokens.clone());
         Ok(())
     }
 

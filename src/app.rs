@@ -50,13 +50,13 @@ pub async fn serve(args: ServeArgs) -> ExitCode {
     let api_key = std::env::var(&config.server.api_key_env)
         .ok()
         .filter(|value| !value.is_empty());
-    // Self-exec agents run local code: a non-loopback bind needs both opt-in and a key.
-    if !(addr.ip().is_loopback() || (config.server.allow_remote && api_key.is_some())) {
-        tracing::error!(
-            "refusing non-loopback listen {addr}: set server.allow_remote = true and put \
-             a key in {} first",
-            config.server.api_key_env
-        );
+    if let Err(err) = check_listen_policy(
+        addr,
+        config.server.allow_remote,
+        api_key.is_some(),
+        &config.server.api_key_env,
+    ) {
+        tracing::error!("{err}");
         return ExitCode::FAILURE;
     }
     let flags = SocketFlags {
@@ -153,6 +153,7 @@ pub async fn serve(args: ServeArgs) -> ExitCode {
             loop {
                 tokio::time::sleep(REAPER_INTERVAL).await;
                 service.reap_expired().await;
+                service.sweep_untagged_tabs().await;
             }
         }
     });
@@ -191,6 +192,29 @@ pub async fn serve(args: ServeArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+/// Self-exec agents run local code: `allow_remote` needs a key even on loopback
+/// (DNS rebinding), and a non-loopback bind needs both opt-in and a key.
+fn check_listen_policy(
+    addr: SocketAddr,
+    allow_remote: bool,
+    has_api_key: bool,
+    api_key_env: &str,
+) -> Result<(), String> {
+    if allow_remote && !has_api_key {
+        return Err(format!(
+            "refusing server.allow_remote = true without an API key: put a key in \
+             {api_key_env} first"
+        ));
+    }
+    if !(addr.ip().is_loopback() || allow_remote) {
+        return Err(format!(
+            "refusing non-loopback listen {addr}: set server.allow_remote = true and put \
+             a key in {api_key_env} first"
+        ));
+    }
+    Ok(())
 }
 
 fn question_hook_url(addr: SocketAddr) -> String {
@@ -255,6 +279,29 @@ mod tests {
             question_hook_url("[::]:8787".parse::<SocketAddr>().unwrap()),
             "http://[::1]:8787/internal/claude-hooks/pre-tool-use"
         );
+    }
+
+    #[test]
+    fn listen_policy_requires_a_key_for_allow_remote() {
+        let loopback: SocketAddr = "127.0.0.1:8787".parse().unwrap();
+        let remote: SocketAddr = "0.0.0.0:8787".parse().unwrap();
+        let env = "MY_KEY_ENV";
+
+        assert!(check_listen_policy(loopback, false, false, env).is_ok());
+        assert!(check_listen_policy(loopback, false, true, env).is_ok());
+        assert!(check_listen_policy(loopback, true, true, env).is_ok());
+        assert!(check_listen_policy(remote, true, true, env).is_ok());
+
+        // allow_remote without a key is refused even on loopback.
+        let err = check_listen_policy(loopback, true, false, env).unwrap_err();
+        assert!(err.contains(env), "{err}");
+        let err = check_listen_policy(remote, true, false, env).unwrap_err();
+        assert!(err.contains(env), "{err}");
+
+        // Non-loopback without opt-in is refused, key or not.
+        let err = check_listen_policy(remote, false, true, env).unwrap_err();
+        assert!(err.contains(env), "{err}");
+        assert!(check_listen_policy(remote, false, false, env).is_err());
     }
 
     #[tokio::test]

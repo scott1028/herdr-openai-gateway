@@ -61,6 +61,19 @@ pub trait HerdrApi: Send + Sync + 'static {
         text: &str,
         keys: &[&str],
     ) -> impl Future<Output = Result<(), HerdrError>> + Send;
+    fn pane_list(
+        &self,
+        workspace_id: &str,
+    ) -> impl Future<Output = Result<Vec<PaneInfo>, HerdrError>> + Send;
+    /// Set metadata tokens on a pane (herdr `pane.report_metadata`); they
+    /// expire after `ttl_ms` unless reported again.
+    fn pane_report_tokens(
+        &self,
+        pane_id: &str,
+        source: &str,
+        tokens: &BTreeMap<String, String>,
+        ttl_ms: Option<u64>,
+    ) -> impl Future<Output = Result<(), HerdrError>> + Send;
 
     fn agent_get(&self, target: &str)
         -> impl Future<Output = Result<AgentInfo, HerdrError>> + Send;
@@ -196,6 +209,9 @@ pub struct PaneInfo {
     pub tab_id: String,
     #[serde(default)]
     pub workspace_id: String,
+    /// Metadata tokens; herdr omits the field when empty.
+    #[serde(default)]
+    pub tokens: BTreeMap<String, String>,
 }
 
 /// Lenient mirror of `AgentSessionInfo`.
@@ -280,6 +296,12 @@ struct WorkspaceListResult {
 struct TabListResult {
     #[serde(default)]
     tabs: Vec<TabInfo>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PaneListResult {
+    #[serde(default)]
+    panes: Vec<PaneInfo>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -718,6 +740,27 @@ mod tests {
         let created = decode_result::<TabCreated>(result, "tab_created").expect("decode");
         assert_eq!(created.tab.tab_id, "w1:t3");
         assert_eq!(created.root_pane.pane_id, "w1:p3");
+    }
+
+    #[test]
+    fn decodes_pane_list_result() {
+        let result = serde_json::json!({
+            "type": "pane_list",
+            "panes": [
+                {"pane_id": "w1:p3", "terminal_id": "t10", "workspace_id": "w1",
+                 "tab_id": "w1:t3", "focused": false, "agent_status": "idle",
+                 "tokens": {"oa_owner": "owner-1"}},
+                {"pane_id": "w1:p4", "terminal_id": "t11", "workspace_id": "w1",
+                 "tab_id": "w1:t4", "focused": false, "agent_status": "unknown"}
+            ]
+        });
+        let list = decode_result::<PaneListResult>(result, "pane_list").expect("decode");
+        assert_eq!(list.panes[0].tab_id, "w1:t3");
+        assert_eq!(
+            list.panes[0].tokens.get("oa_owner").map(String::as_str),
+            Some("owner-1")
+        );
+        assert!(list.panes[1].tokens.is_empty());
     }
 
     #[test]

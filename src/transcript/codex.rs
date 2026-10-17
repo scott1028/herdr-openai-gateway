@@ -177,7 +177,12 @@ pub fn codex_sessions_root(
 /// Find `rollout-*-<session_id>.jsonl` under `<sessions_root>/YYYY/MM/DD`,
 /// walking date directories newest first.
 pub fn locate_codex_rollout(sessions_root: &Path, session_id: &str) -> Option<PathBuf> {
-    if session_id.is_empty() || session_id.contains('/') {
+    // The id becomes part of a file name: allow only uuid-like characters.
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return None;
     }
     let suffix = format!("-{session_id}.jsonl");
@@ -458,6 +463,30 @@ mod tests {
             locate_codex_rollout(&dir.join("no-sessions"), "sess-9"),
             None
         );
+
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn locate_rejects_path_like_session_ids() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-openai-server-codex-ids-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let day = dir.join("2026").join("10").join("14");
+        std::fs::create_dir_all(&day).expect("mkdir day");
+        let uuid = "0b0e6f1c-3c2a-4d5e-9f10-2a3b4c5d6e7f";
+        let rollout = day.join(format!("rollout-2026-10-14T00-00-00-{uuid}.jsonl"));
+        std::fs::write(&rollout, "{}\n").expect("write rollout");
+
+        assert_eq!(locate_codex_rollout(&dir, uuid), Some(rollout));
+        assert_eq!(locate_codex_rollout(&dir, ".."), None);
+        assert_eq!(locate_codex_rollout(&dir, "a/b"), None);
+        assert_eq!(locate_codex_rollout(&dir, "a\\b"), None);
 
         std::fs::remove_dir_all(&dir).expect("remove temp dir");
     }

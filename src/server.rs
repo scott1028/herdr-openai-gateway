@@ -13,6 +13,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use sha2::{Digest as _, Sha256};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
@@ -86,12 +87,12 @@ fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
 }
 
 /// Hand-written constant-time comparison to avoid leaking the key through timing.
+/// Both sides are hashed first, so the compared length is always 32 bytes and the
+/// secret's length does not leak either.
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+    let (a, b) = (Sha256::digest(a), Sha256::digest(b));
     let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
+    for (x, y) in a.iter().zip(b.iter()) {
         diff |= x ^ y;
     }
     diff == 0
@@ -404,19 +405,34 @@ fn split_content(text: &str) -> Vec<String> {
     pieces
 }
 
-/// `--log-requests`: headers (Authorization redacted) and body shape only; the
-/// message text is never logged.
-fn log_request_shape(headers: &HeaderMap, request: &ChatRequest) {
-    let header_text: Vec<String> = headers
+/// Credential headers whose values `--log-requests` never prints.
+const REDACTED_HEADERS: [&str; 6] = [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "x-api-key",
+    "api-key",
+    "x-herdr-hook-token",
+];
+
+/// `name: value` per header, with credential headers redacted.
+fn format_header_text(headers: &HeaderMap) -> Vec<String> {
+    headers
         .iter()
         .map(|(name, value)| {
-            if name.as_str() == "authorization" {
+            if REDACTED_HEADERS.contains(&name.as_str()) {
                 format!("{name}: [redacted]")
             } else {
                 format!("{name}: {}", value.to_str().unwrap_or("<non-utf8>"))
             }
         })
-        .collect();
+        .collect()
+}
+
+/// `--log-requests`: headers (credentials redacted) and body shape only; the
+/// message text is never logged.
+fn log_request_shape(headers: &HeaderMap, request: &ChatRequest) {
+    let header_text = format_header_text(headers);
     let message_shapes: Vec<String> = request
         .messages
         .iter()
@@ -487,6 +503,29 @@ mod tests {
         assert!(!constant_time_eq(b"key", b"kez"));
         assert!(!constant_time_eq(b"key", b"keys"));
         assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"", b"key"));
+        let long = "k".repeat(1000);
+        assert!(constant_time_eq(long.as_bytes(), long.as_bytes()));
+        assert!(!constant_time_eq(long.as_bytes(), b"k"));
+    }
+
+    #[test]
+    fn credential_headers_are_redacted_in_request_logs() {
+        let mut headers = HeaderMap::new();
+        for name in REDACTED_HEADERS {
+            headers.insert(name, HeaderValue::from_static("secret-value"));
+        }
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+
+        let text = format_header_text(&headers);
+        assert!(
+            !text.iter().any(|line| line.contains("secret-value")),
+            "{text:?}"
+        );
+        for name in REDACTED_HEADERS {
+            assert!(text.contains(&format!("{name}: [redacted]")), "{text:?}");
+        }
+        assert!(text.contains(&"content-type: application/json".to_string()));
     }
 
     #[test]

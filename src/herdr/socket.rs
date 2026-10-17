@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,9 +9,9 @@ use tokio::net::UnixStream;
 
 use super::{
     decode_response, decode_result, parse_pong, AgentInfo, AgentInfoResult, AgentStart,
-    AgentStarted, HerdrApi, HerdrError, PaneReadResult, Pong, ReadSource, RequestEnvelope,
-    TabCreate, TabCreated, TabInfo, TabInfoResult, TabListResult, WaitSpec, WorkspaceCreated,
-    WorkspaceInfo, WorkspaceListResult,
+    AgentStarted, HerdrApi, HerdrError, PaneInfo, PaneListResult, PaneReadResult, Pong, ReadSource,
+    RequestEnvelope, TabCreate, TabCreated, TabInfo, TabInfoResult, TabListResult, WaitSpec,
+    WorkspaceCreated, WorkspaceInfo, WorkspaceListResult,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -207,6 +208,29 @@ impl HerdrApi for SocketHerdr {
     ) -> Result<(), HerdrError> {
         let params = serde_json::json!({"pane_id": pane_id, "text": text, "keys": keys});
         let result = self.request("pane.send_input", params).await?;
+        decode_result::<serde_json::Value>(result, "ok")?;
+        Ok(())
+    }
+
+    async fn pane_list(&self, workspace_id: &str) -> Result<Vec<PaneInfo>, HerdrError> {
+        let params = serde_json::json!({"workspace_id": workspace_id});
+        let result = self.request("pane.list", params).await?;
+        Ok(decode_result::<PaneListResult>(result, "pane_list")?.panes)
+    }
+
+    async fn pane_report_tokens(
+        &self,
+        pane_id: &str,
+        source: &str,
+        tokens: &BTreeMap<String, String>,
+        ttl_ms: Option<u64>,
+    ) -> Result<(), HerdrError> {
+        let mut params =
+            serde_json::json!({"pane_id": pane_id, "source": source, "tokens": tokens});
+        if let Some(ttl_ms) = ttl_ms {
+            params["ttl_ms"] = serde_json::json!(ttl_ms);
+        }
+        let result = self.request("pane.report_metadata", params).await?;
         decode_result::<serde_json::Value>(result, "ok")?;
         Ok(())
     }

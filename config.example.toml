@@ -13,7 +13,8 @@ listen = "127.0.0.1:8787"
 # `Authorization: Bearer <key>`. Empty or unset means no key is required.
 api_key_env = "HERDR_OPENAI_SERVER_API_KEY"
 # Allow non-loopback Host/Origin headers. Only set this behind your own proxy
-# or VPN, and always together with an API key.
+# or VPN. Requires an API key in api_key_env: startup is refused without one,
+# even on a loopback bind.
 allow_remote = false
 
 [herdr]

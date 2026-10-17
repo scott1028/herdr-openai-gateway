@@ -176,6 +176,11 @@ agent remains subject to `idle_ttl_secs`.
   a side request (title generation, compaction) and is rejected with HTTP 409.
   See `small_model` below.
 
+Each backing pane carries an `oa_owner` herdr metadata token naming the server instance that
+launched it; the token is refreshed every 30 s and expires 90 s after the last refresh.
+Cleanup of leftover `oa:` tabs, at startup and on the reaper tick, never closes a tab that
+another live instance owns, so two servers can share one herdr session.
+
 ## opencode
 
 `opencode.json`:
@@ -265,7 +270,8 @@ a shell.
 - Set `HERDR_OPENAI_SERVER_API_KEY` (or `server.api_key_env` to another name) to require
   `Authorization: Bearer <key>`. Unset means no key.
 - `Host` and `Origin` are checked against the bind address; `server.allow_remote = true`
-  relaxes that for a proxy you run yourself.
+  relaxes that for a proxy you run yourself. `allow_remote` requires an API key: without
+  one the server refuses to start, even on a loopback bind.
 - `defaults.allowed_cwd_roots` limits which directories a request may ask for.
 - Self-exec agents run commands and edit files in that directory with your local
   permissions. Anyone who can reach this HTTP port can drive your agents: treat the port

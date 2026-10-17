@@ -543,8 +543,8 @@ mod tests {
     use crate::config::{AgentKind, ModelSpec};
     use crate::herdr::fake::{FakeHerdr, ScriptedTurn};
     use crate::herdr::{
-        AgentInfo, AgentStart, AgentStarted, HerdrApi, HerdrError, Pong, TabCreate, TabCreated,
-        TabInfo, WaitSpec, WorkspaceCreated, WorkspaceInfo,
+        AgentInfo, AgentStart, AgentStarted, HerdrApi, HerdrError, PaneInfo, Pong, TabCreate,
+        TabCreated, TabInfo, WaitSpec, WorkspaceCreated, WorkspaceInfo,
     };
     use std::collections::BTreeMap;
     use std::future::Future;
@@ -661,6 +661,22 @@ mod tests {
             keys: &[&str],
         ) -> impl Future<Output = Result<(), HerdrError>> + Send {
             self.inner.pane_send_input(pane_id, text, keys)
+        }
+        fn pane_list(
+            &self,
+            workspace_id: &str,
+        ) -> impl Future<Output = Result<Vec<PaneInfo>, HerdrError>> + Send {
+            self.inner.pane_list(workspace_id)
+        }
+        fn pane_report_tokens(
+            &self,
+            pane_id: &str,
+            source: &str,
+            tokens: &BTreeMap<String, String>,
+            ttl_ms: Option<u64>,
+        ) -> impl Future<Output = Result<(), HerdrError>> + Send {
+            self.inner
+                .pane_report_tokens(pane_id, source, tokens, ttl_ms)
         }
         fn agent_get(
             &self,
@@ -810,9 +826,16 @@ mod tests {
             .with_transcript_root(&root)
             .with_turns(turns);
         let workspace_id = ensure_workspace(&fake, "openai-api").await.expect("ws");
-        let handle = spawn_agent(&fake, &workspace_id, &model(), Path::new("/tmp"), 1_000)
-            .await
-            .expect("spawn");
+        let handle = spawn_agent(
+            &fake,
+            &workspace_id,
+            &model(),
+            Path::new("/tmp"),
+            1_000,
+            "owner-test",
+        )
+        .await
+        .expect("spawn");
         (fake, handle, root)
     }
 
@@ -1255,6 +1278,7 @@ mod tests {
             &codex_model(),
             Path::new("/tmp"),
             1_000,
+            "owner-test",
         )
         .await
         .expect("spawn");

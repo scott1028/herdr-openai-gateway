@@ -248,7 +248,12 @@ fn push_unique(roots: &mut Vec<PathBuf>, path: Option<&str>) {
 
 /// Find `<root>/projects/*/<session_id>.jsonl` under the given roots.
 pub fn locate_claude_transcript(roots: &[PathBuf], session_id: &str) -> Option<PathBuf> {
-    if session_id.is_empty() || session_id.contains('/') {
+    // The id becomes a file name: allow only uuid-like characters.
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return None;
     }
     for root in roots {
@@ -491,6 +496,33 @@ mod tests {
         assert_eq!(locate_claude_transcript(&roots, "missing"), None);
         assert_eq!(locate_claude_transcript(&roots, ""), None);
         assert_eq!(locate_claude_transcript(&roots, "a/b"), None);
+
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn locate_rejects_path_like_session_ids() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-openai-server-claude-ids-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let project = dir.join("projects").join("-tmp");
+        std::fs::create_dir_all(&project).expect("mkdir project");
+        let uuid = "0b0e6f1c-3c2a-4d5e-9f10-2a3b4c5d6e7f";
+        std::fs::write(project.join(format!("{uuid}.jsonl")), "{}\n").expect("write transcript");
+        let roots = vec![dir.clone()];
+
+        assert_eq!(
+            locate_claude_transcript(&roots, uuid),
+            Some(project.join(format!("{uuid}.jsonl")))
+        );
+        assert_eq!(locate_claude_transcript(&roots, ".."), None);
+        assert_eq!(locate_claude_transcript(&roots, "a/b"), None);
+        assert_eq!(locate_claude_transcript(&roots, "a\\b"), None);
 
         std::fs::remove_dir_all(&dir).expect("remove temp dir");
     }

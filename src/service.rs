@@ -1,6 +1,6 @@
 //! Coordination layer: classify -> spawn/turn -> commit, in-flight join, caps, reaper.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::sync::{oneshot, watch};
+use uuid::Uuid;
 
-use crate::agents::lifecycle::{self, AgentHandle, SpawnError};
+use crate::agents::lifecycle::{self, AgentHandle, LaunchExtras, SpawnError};
 use crate::agents::turn::{self, BlockedHook, TranscriptRoots, TurnLimits, TurnOutcome};
 use crate::client_process::{self, ClientProcess};
 use crate::config::{AgentKind, Config, ModelMode, ModelSpec};
@@ -284,6 +285,10 @@ pub struct Service<H: HerdrApi> {
     inflight: Mutex<BTreeMap<ConversationId, InflightTurn>>,
     clients: Mutex<BTreeMap<ConversationId, TrackedClient>>,
     workspace_id: Mutex<Option<String>>,
+    /// This instance's `oa_owner` pane token value.
+    owner_id: String,
+    /// `oa:` tabs the previous periodic sweep saw without an owner token.
+    untagged_tabs: Mutex<BTreeSet<String>>,
 }
 
 struct HookRequestGuard<'a, H: HerdrApi> {
@@ -382,6 +387,8 @@ impl<H: HerdrApi> Service<H> {
             inflight: Mutex::new(BTreeMap::new()),
             clients: Mutex::new(BTreeMap::new()),
             workspace_id: Mutex::new(None),
+            owner_id: Uuid::new_v4().to_string(),
+            untagged_tabs: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -474,7 +481,7 @@ impl<H: HerdrApi> Service<H> {
                     name = %handle.name,
                     "closing backing agent after its OpenCode client exited"
                 );
-                lifecycle::close_agent(&*self.herdr, &handle).await;
+                lifecycle::close_agent(&*self.herdr, &handle, &self.owner_id).await;
             }
         }
     }
@@ -680,7 +687,7 @@ impl<H: HerdrApi> Service<H> {
         };
         // Forked or evicted agents close only after every lock is released.
         for handle in std::mem::take(&mut plan.close) {
-            lifecycle::close_agent(&*self.herdr, &handle).await;
+            lifecycle::close_agent(&*self.herdr, &handle, &self.owner_id).await;
         }
         let id = plan.id;
         let rx = self.spawn_turn(plan, req);
@@ -1114,7 +1121,7 @@ impl<H: HerdrApi> Service<H> {
             };
             if let Some(handle) = handle {
                 tracing::info!(name = %handle.name, "reaping idle backing agent");
-                lifecycle::close_agent(&*self.herdr, &handle).await;
+                lifecycle::close_agent(&*self.herdr, &handle, &self.owner_id).await;
             }
         }
     }
@@ -1134,9 +1141,72 @@ impl<H: HerdrApi> Service<H> {
         else {
             return;
         };
-        let closed = lifecycle::sweep_orphans(&*self.herdr, &workspace.workspace_id).await;
+        let closed =
+            lifecycle::sweep_orphans(&*self.herdr, &workspace.workspace_id, &self.owner_id).await;
         if closed > 0 {
             tracing::info!(closed, "closed orphan backing tabs from a previous run");
+        }
+    }
+
+    /// Reaper tick: refresh our owner tokens, then close `oa:` tabs that had no
+    /// owner token on this tick and the previous one. Waiting for a second
+    /// sighting avoids racing a launch between `tab.create` and its token report.
+    /// Tabs of tracked agents are never closed here.
+    pub async fn sweep_untagged_tabs(&self) {
+        // Re-tag tracked panes first: refresh only finds panes whose token is
+        // still ours, so a token that expired during a stall would stay lost.
+        let tracked_panes: Vec<String> = self
+            .locked_agents()
+            .values()
+            .map(|handle| handle.pane_id.clone())
+            .collect();
+        for pane_id in tracked_panes {
+            if let Err(err) =
+                lifecycle::report_owner_token(&*self.herdr, &pane_id, &self.owner_id).await
+            {
+                tracing::warn!(pane_id = %pane_id, "owner token re-report failed: {err}");
+            }
+        }
+        let workspace_id = match self.herdr.workspace_list().await {
+            Ok(workspaces) => workspaces
+                .into_iter()
+                .find(|ws| ws.label == self.config.herdr.workspace_label)
+                .map(|ws| ws.workspace_id),
+            Err(err) => {
+                tracing::warn!("cannot sweep untagged tabs: {err}");
+                None
+            }
+        };
+        let Some(workspace_id) = workspace_id else {
+            lock(&self.untagged_tabs).clear();
+            return;
+        };
+        lifecycle::refresh_owner_tokens(&*self.herdr, &workspace_id, &self.owner_id).await;
+        let untagged =
+            match lifecycle::scan_owner_tokens(&*self.herdr, &workspace_id, &self.owner_id).await {
+                Ok(scan) => scan.untagged,
+                Err(err) => {
+                    tracing::warn!("cannot sweep untagged tabs: {err}");
+                    Vec::new()
+                }
+            };
+        let seen_before = std::mem::replace(
+            &mut *lock(&self.untagged_tabs),
+            untagged.iter().map(|tab| tab.tab_id.clone()).collect(),
+        );
+        let tracked_tabs: BTreeSet<String> = self
+            .locked_agents()
+            .values()
+            .map(|handle| handle.tab_id.clone())
+            .collect();
+        for tab in untagged {
+            if !seen_before.contains(&tab.tab_id) || tracked_tabs.contains(&tab.tab_id) {
+                continue;
+            }
+            tracing::info!(tab_id = %tab.tab_id, label = %tab.label, "closing untagged backing tab");
+            if let Err(err) = self.herdr.tab_close(&tab.tab_id).await {
+                tracing::warn!(tab_id = %tab.tab_id, "tab.close failed: {err}");
+            }
         }
     }
 
@@ -1145,7 +1215,7 @@ impl<H: HerdrApi> Service<H> {
         self.locked_clients().clear();
         let owned = std::mem::take(&mut *self.locked_agents());
         for handle in owned.into_values() {
-            lifecycle::close_agent(&*self.herdr, &handle).await;
+            lifecycle::close_agent(&*self.herdr, &handle, &self.owner_id).await;
         }
     }
 
@@ -1200,21 +1270,22 @@ impl<H: HerdrApi> Service<H> {
             Ok(workspace_id) => workspace_id,
             Err(err) => return Err(LaunchError::Failed(err)),
         };
-        let mut extra_args = Vec::new();
-        let mut extra_env = BTreeMap::new();
+        let mut extras = LaunchExtras::default();
         if model.kind == AgentKind::Claude {
             if !model.env.contains_key(CLAUDE_DISABLE_AGENT_VIEW_ENV) {
-                extra_env.insert(CLAUDE_DISABLE_AGENT_VIEW_ENV.to_string(), "1".to_string());
+                extras
+                    .env
+                    .insert(CLAUDE_DISABLE_AGENT_VIEW_ENV.to_string(), "1".to_string());
             }
             if let Some(hook) = self.env.question_hook.as_ref() {
-                extra_args = vec![
+                extras.args = vec![
                     "--settings".to_string(),
                     question_hook::claude_settings_arg(
                         &hook.url,
                         self.config.herdr.blocked_timeout_ms / 1000 + 30,
                     ),
                 ];
-                extra_env.insert(
+                extras.env.insert(
                     "HERDR_OPENAI_SERVER_HOOK_TOKEN".to_string(),
                     hook.token.clone(),
                 );
@@ -1226,8 +1297,8 @@ impl<H: HerdrApi> Service<H> {
             model,
             &cwd,
             timeout,
-            &extra_args,
-            &extra_env,
+            &extras,
+            &self.owner_id,
         )
         .await
         {
@@ -1244,8 +1315,8 @@ impl<H: HerdrApi> Service<H> {
                     model,
                     &cwd,
                     timeout,
-                    &extra_args,
-                    &extra_env,
+                    &extras,
+                    &self.owner_id,
                 )
                 .await
                 {
@@ -1593,7 +1664,7 @@ impl<H: HerdrApi> Service<H> {
         generation: u64,
         handle: &AgentHandle,
     ) -> ApiError {
-        lifecycle::close_agent(&*self.herdr, handle).await;
+        lifecycle::close_agent(&*self.herdr, handle, &self.owner_id).await;
         self.locked_agents().remove(&id);
         if !self.is_superseded(id, generation) {
             self.locked_registry().remove(id);
@@ -1995,7 +2066,7 @@ impl<H: HerdrApi> Service<H> {
         };
         if gone {
             tracing::warn!(name = %agent.name, "backing agent is gone; respawning");
-            lifecycle::close_agent(&*self.herdr, &agent).await;
+            lifecycle::close_agent(&*self.herdr, &agent, &self.owner_id).await;
             agent = match self.spawn_agent_for(id).await {
                 Ok(handle) => handle,
                 Err(LaunchError::Blocked { handle }) => {
@@ -2229,7 +2300,7 @@ impl<H: HerdrApi> Service<H> {
             name = %handle.name,
             "closing backing agent after its conversation was removed"
         );
-        lifecycle::close_agent(&*self.herdr, handle).await;
+        lifecycle::close_agent(&*self.herdr, handle, &self.owner_id).await;
     }
 
     async fn register_agent_or_close(&self, id: ConversationId, handle: &AgentHandle) -> bool {
@@ -4070,6 +4141,186 @@ mod tests {
             1,
             "startup_sweep must not create the workspace"
         );
+        f.cleanup();
+    }
+
+    #[tokio::test]
+    async fn periodic_sweep_closes_untagged_tabs_on_the_second_tick() {
+        let f = Fixture::new(
+            Config::builtin(),
+            FakeHerdr::new().with_turns([ScriptedTurn::Reply("answer".to_string())]),
+        );
+        let outcome = f
+            .service
+            .chat(req("claude+agent-tools", Some("k1"), vec![user("hello")]))
+            .await
+            .expect("chat");
+        let mut seeded = BTreeMap::new();
+        for (label, owner) in [
+            ("oa:claude:aaaaaa", None),
+            ("oa:claude:bbbbbb", Some("other-instance")),
+            ("oa:claude:cccccc", None),
+        ] {
+            let created = f
+                .fake
+                .tab_create(crate::herdr::TabCreate {
+                    workspace_id: "w1",
+                    cwd: None,
+                    label: Some(label),
+                    env: &BTreeMap::new(),
+                    focus: false,
+                })
+                .await
+                .expect("seed tab");
+            if let Some(owner) = owner {
+                let tokens =
+                    BTreeMap::from([(lifecycle::OWNER_TOKEN_KEY.to_string(), owner.to_string())]);
+                f.fake
+                    .pane_report_tokens(&created.root_pane.pane_id, "test", &tokens, None)
+                    .await
+                    .expect("tag");
+            }
+            seeded.insert(label, created.root_pane.pane_id);
+        }
+        let refreshes = |fake: &FakeHerdr| {
+            fake.calls()
+                .into_iter()
+                .filter(|c| {
+                    c.method == "pane.report_metadata"
+                        && c.param("source") == Some(lifecycle::OWNER_TOKEN_SOURCE)
+                })
+                .filter_map(|c| c.param("pane_id").map(String::from))
+                .collect::<Vec<_>>()
+        };
+        let before = refreshes(&f.fake).len();
+
+        f.service.sweep_untagged_tabs().await;
+        let labels = f.fake.tab_labels("w1");
+        assert!(
+            labels.contains(&"oa:claude:aaaaaa".to_string()),
+            "first sighting"
+        );
+        assert!(
+            labels.contains(&"oa:claude:cccccc".to_string()),
+            "first sighting"
+        );
+        // Only our agent's pane gets its token refreshed (tracked re-tag + refresh).
+        let refreshed = refreshes(&f.fake);
+        let agent_tab = f
+            .fake
+            .tab_list("w1")
+            .await
+            .expect("tabs")
+            .into_iter()
+            .find(|tab| tab.label == outcome.tab_label)
+            .expect("agent tab");
+        let agent_pane = f
+            .fake
+            .pane_list("w1")
+            .await
+            .expect("panes")
+            .into_iter()
+            .find(|pane| pane.tab_id == agent_tab.tab_id)
+            .expect("agent pane");
+        let new_reports = &refreshed[before..];
+        assert!(!new_reports.is_empty(), "{refreshed:?}");
+        assert!(
+            new_reports
+                .iter()
+                .all(|pane_id| *pane_id == agent_pane.pane_id),
+            "{refreshed:?}"
+        );
+
+        // `cccccc` finishes its launch between the ticks: tagged now, so it stays.
+        let tokens = BTreeMap::from([(
+            lifecycle::OWNER_TOKEN_KEY.to_string(),
+            f.service.owner_id.clone(),
+        )]);
+        f.fake
+            .pane_report_tokens(&seeded["oa:claude:cccccc"], "test", &tokens, None)
+            .await
+            .expect("tag in-flight tab");
+
+        f.service.sweep_untagged_tabs().await;
+        let labels = f.fake.tab_labels("w1");
+        assert!(!labels.contains(&"oa:claude:aaaaaa".to_string()));
+        assert!(labels.contains(&"oa:claude:bbbbbb".to_string()));
+        assert!(labels.contains(&"oa:claude:cccccc".to_string()));
+        assert!(labels.contains(&outcome.tab_label));
+        f.cleanup();
+    }
+
+    #[tokio::test]
+    async fn periodic_sweep_retags_tracked_agents_whose_token_expired() {
+        let f = Fixture::new(
+            Config::builtin(),
+            FakeHerdr::new().with_turns([ScriptedTurn::Reply("answer".to_string())]),
+        );
+        f.service
+            .chat(req("claude+agent-tools", Some("k1"), vec![user("hello")]))
+            .await
+            .expect("chat");
+        let handle = f
+            .service
+            .locked_agents()
+            .values()
+            .next()
+            .cloned()
+            .expect("tracked agent");
+        f.fake.clear_pane_tokens(&handle.pane_id);
+        let before = f.fake.calls().len();
+
+        f.service.sweep_untagged_tabs().await;
+        f.service.sweep_untagged_tabs().await;
+
+        assert!(f.fake.tab_labels("w1").contains(&handle.tab_label));
+        let calls = f.fake.calls();
+        let report = calls[before..]
+            .iter()
+            .find(|c| {
+                c.method == "pane.report_metadata"
+                    && c.param("pane_id") == Some(handle.pane_id.as_str())
+            })
+            .expect("token re-reported");
+        assert_eq!(report.param("source"), Some(lifecycle::OWNER_TOKEN_SOURCE));
+        assert_eq!(
+            report.param("token.oa_owner"),
+            Some(f.service.owner_id.as_str())
+        );
+        assert_eq!(report.param("ttl_ms"), Some("90000"));
+        f.cleanup();
+    }
+
+    #[tokio::test]
+    async fn periodic_sweep_never_closes_a_tracked_tab() {
+        let f = Fixture::new(
+            Config::builtin(),
+            FakeHerdr::new().with_turns([ScriptedTurn::Reply("answer".to_string())]),
+        );
+        f.service
+            .chat(req("claude+agent-tools", Some("k1"), vec![user("hello")]))
+            .await
+            .expect("chat");
+        // Point the tracked handle at a missing pane so the re-report fails,
+        // and drop the real pane's token: the tab now looks untagged.
+        let handle = {
+            let mut agents = f.service.locked_agents();
+            let tracked = agents.values_mut().next().expect("tracked agent");
+            let real = tracked.clone();
+            tracked.pane_id = "w1:p-gone".to_string();
+            real
+        };
+        f.fake.clear_pane_tokens(&handle.pane_id);
+
+        f.service.sweep_untagged_tabs().await;
+        f.service.sweep_untagged_tabs().await;
+
+        assert!(f.fake.tab_labels("w1").contains(&handle.tab_label));
+        assert!(!f
+            .fake
+            .calls()
+            .iter()
+            .any(|c| c.method == "tab.close" && c.param("tab_id") == Some(handle.tab_id.as_str())));
         f.cleanup();
     }
 
