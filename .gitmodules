@@ -1,0 +1,3 @@
+[submodule "references/herdr"]
+	path = references/herdr
+	url = git@github.com:herdrdev/herdr.git
