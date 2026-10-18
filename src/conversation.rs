@@ -647,6 +647,23 @@ impl Registry {
         self.records.get(&id)
     }
 
+    pub fn records(&self) -> impl Iterator<Item = &ConversationRecord> {
+        self.records.values()
+    }
+
+    /// Put back what a saved conversation's CLI had already seen.
+    pub fn restore_progress(
+        &mut self,
+        id: ConversationId,
+        user_digests: Vec<String>,
+        consumed: usize,
+    ) {
+        if let Some(record) = self.records.get_mut(&id) {
+            record.user_digests = user_digests;
+            record.consumed = consumed;
+        }
+    }
+
     pub fn expired(&self, now: Instant, idle_ttl: Duration) -> Vec<ConversationId> {
         self.records
             .values()

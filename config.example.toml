@@ -46,6 +46,12 @@ idle_ttl_secs = 1800
 max_agents_per_model = 3
 # Cap on live agents overall.
 max_agents_total = 8
+# File that keeps conversations across restarts: which tab each conversation runs
+# in, what its CLI has already seen, and its CLI session id. Unset means
+# $XDG_STATE_HOME/herdr-openai-gateway/state.json, or
+# ~/.local/state/herdr-openai-gateway/state.json when XDG_STATE_HOME is unset.
+# One file per server: a second server pointed at the same file refuses to start.
+# state_file = "~/.local/state/herdr-openai-gateway/state.json"
 
 [defaults]
 # Last resort for the agent cwd. Precedence: `X-Herdr-Cwd`, then the `Working directory`

@@ -187,15 +187,13 @@ pub struct LaunchExtras {
     pub env: BTreeMap<String, String>,
 }
 
-/// Launch a backing agent: create the tab, tag its pane with `owner_id`, and
-/// start the process. The returned handle has `ready = false`; call
-/// [`await_ready`] before prompting it.
-pub async fn launch_agent<H: HerdrApi>(
+/// Create a backing tab on `cwd` and tag its pane with `owner_id`, with no CLI
+/// in it yet. The handle names the tab, its pane, and the agent name to use.
+pub async fn open_backing_tab<H: HerdrApi>(
     h: &H,
     workspace_id: &str,
     model: &ModelSpec,
     cwd: &Path,
-    startup_timeout_ms: u64,
     extras: &LaunchExtras,
     owner_id: &str,
 ) -> Result<AgentHandle, SpawnError> {
@@ -220,6 +218,37 @@ pub async fn launch_agent<H: HerdrApi>(
         close_backing_tab(h, &tab_id).await;
         return Err(SpawnError::Herdr(err));
     }
+    Ok(AgentHandle {
+        name: agent_name(&model.id, &suffix),
+        kind: model.kind,
+        model_id: model.id.clone(),
+        pane_id,
+        tab_id,
+        tab_label: label,
+        workspace_id: workspace_id.to_string(),
+        cwd: cwd.to_path_buf(),
+        session_id: None,
+        transcript: None,
+        ready: false,
+        managed: false,
+    })
+}
+
+/// Launch a backing agent: create the tab, tag its pane with `owner_id`, and
+/// start the process. The returned handle has `ready = false`; call
+/// [`await_ready`] before prompting it.
+pub async fn launch_agent<H: HerdrApi>(
+    h: &H,
+    workspace_id: &str,
+    model: &ModelSpec,
+    cwd: &Path,
+    startup_timeout_ms: u64,
+    extras: &LaunchExtras,
+    owner_id: &str,
+) -> Result<AgentHandle, SpawnError> {
+    let mut handle = open_backing_tab(h, workspace_id, model, cwd, extras, owner_id).await?;
+    let tab_id = handle.tab_id.clone();
+    let pane_id = handle.pane_id.clone();
 
     let (session_id, kind_args) = match model.kind {
         AgentKind::Claude => {
@@ -236,7 +265,7 @@ pub async fn launch_agent<H: HerdrApi>(
     let command = model.command.as_deref().unwrap_or(base);
     let managed = command == base;
 
-    let mut name = agent_name(&model.id, &suffix);
+    let mut name = handle.name.clone();
     if managed {
         let busy_deadline = Instant::now() + PANE_BUSY_WINDOW;
         let mut name_retries = 0usize;
@@ -287,20 +316,10 @@ pub async fn launch_agent<H: HerdrApi>(
         }
     }
 
-    Ok(AgentHandle {
-        name,
-        kind: model.kind,
-        model_id: model.id.clone(),
-        pane_id,
-        tab_id,
-        tab_label: label,
-        workspace_id: workspace_id.to_string(),
-        cwd: cwd.to_path_buf(),
-        session_id,
-        transcript: None,
-        ready: false,
-        managed,
-    })
+    handle.name = name;
+    handle.session_id = session_id;
+    handle.managed = managed;
+    Ok(handle)
 }
 
 /// POSIX single-quote one command-line argument; plain words stay bare.

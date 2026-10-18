@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::herdr::{self, HerdrApi as _, SocketFlags, SocketHerdr};
 use crate::service::{QuestionHookEnv, Service, ServiceEnv};
+use crate::state::StateFile;
 use crate::transcript::claude;
 
 /// Idle conversations are reaped on this cadence.
@@ -130,9 +131,30 @@ pub async fn serve(args: ServeArgs) -> ExitCode {
         })
         .flatten()
         .collect();
+    let state_path = match &config.conversations.state_file {
+        Some(path) => crate::config::expand_tilde(path, &home),
+        None => crate::config::default_state_path(|key| std::env::var(key).ok()),
+    };
+    let state = match StateFile::open(&state_path) {
+        Ok(state) => state,
+        Err(err) => {
+            tracing::error!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let saved = state.load();
+    tracing::info!(
+        path = %state_path.display(),
+        conversations = saved.as_ref().map_or(0, |saved| saved.conversations.len()),
+        "state file"
+    );
     let question_hook = QuestionHookEnv {
         url: question_hook_url(listen_addr),
-        token: Uuid::new_v4().to_string(),
+        // Tabs the previous run left behind carry its token in their env.
+        token: saved
+            .as_ref()
+            .and_then(|saved| saved.hook_token.clone())
+            .unwrap_or_else(|| Uuid::new_v4().to_string()),
     };
     let env = ServiceEnv {
         home,
@@ -147,7 +169,7 @@ pub async fn serve(args: ServeArgs) -> ExitCode {
         proc_root: cfg!(target_os = "linux").then(|| PathBuf::from("/proc")),
         server_addr: Some(listen_addr),
     };
-    let service = Service::new(config, herdr, env);
+    let service = Service::with_state(config, herdr, env, state, saved);
     service.startup_sweep().await;
     let reaper = tokio::spawn({
         let service = Arc::clone(&service);

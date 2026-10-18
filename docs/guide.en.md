@@ -201,6 +201,40 @@ after the last renewal.
 When leftover `oa:` tabs are cleaned up (at startup and on the 30-second tab sweep), any tab whose tag
 names another live instance is left alone. So two servers can safely share one herdr session.
 
+### After a server restart
+
+Restarting the server (to upgrade it or change the config) does not lose your conversations. The
+server keeps each conversation in a **state file**, like the log one shift leaves for the next: which
+tab the conversation runs in, which messages the agent has already seen, and the CLI's session id. On
+the next start it picks the conversations up from that log.
+
+The state file lives at `$XDG_STATE_HOME/herdr-openai-gateway/state.json`, or at
+`~/.local/state/herdr-openai-gateway/state.json` when `XDG_STATE_HOME` is unset. Set
+`conversations.state_file` to put it somewhere else.
+
+How a conversation is picked up depends on what survived:
+
+- **The tab is still there**: a normal stop (Ctrl-C or SIGTERM) leaves the backing tabs open. The next
+  start finds each one by its tab name (`oa:<model id>:<6 hex digits>`), and from then on only new
+  messages are sent. If you never start the server again, close those tabs yourself.
+- **herdr restarted too**: herdr keeps tab names but not name tags, so the server still finds the tab
+  by name and puts a new tag on it. The CLI in the tab is gone; the patrol brings it back in the same
+  pane with `--resume`／`resume`.
+- **The tab is gone** (closed by hand, or the whole workspace is gone): the next request opens a new
+  tab and runs `--resume`／`resume` with the saved session id, so the CLI gets its own context back and
+  again only new messages are sent. If that fails, the request fails; send it again and a new agent
+  starts with the history replayed.
+
+A few things to watch out for:
+
+- One state file serves one server: a second server pointed at the same file refuses to start. To run
+  two servers, give each its own `conversations.state_file`. Once one of them has been down for 90
+  seconds, the name tags on its tabs expire and the other server sweeps those tabs up as orphans.
+- If the server dies in the middle of a turn, that message never made it into the state file. When
+  the client resends it, the agent may get the same message twice.
+- If you change the listen port, a Claude that was already running before the restart still sends its
+  question hook to the old port.
+
 ## Using it with opencode
 
 Add this to `opencode.json`:

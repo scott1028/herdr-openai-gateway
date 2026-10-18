@@ -16,5 +16,6 @@ pub mod prompt;
 pub mod question_hook;
 pub mod server;
 pub mod service;
+pub mod state;
 pub mod toolcall;
 pub mod transcript;

@@ -171,6 +171,32 @@ instance 開的。名牌每 30 秒更新一次，最後一次更新後 90 秒沒
 清理殘留的 `oa:` tab 時（啟動時，以及每 30 秒的 tab 清理），只要看到名牌寫的是另一個還活著的 instance，就
 不會動它。所以兩個 server 可以放心共用同一個 herdr session。
 
+### 重啟 server 之後
+
+重啟 server（升級、改設定）不會弄丟對話。server 把每段對話記在一個**狀態檔**裡，就像交接班時留下的
+值班紀錄：對話在哪個 tab、agent 已經看過哪些訊息、CLI 的 session id。下次啟動時，照這份紀錄把對話接回去。
+
+狀態檔預設放在 `$XDG_STATE_HOME/herdr-openai-gateway/state.json`；沒設 `XDG_STATE_HOME` 就放在
+`~/.local/state/herdr-openai-gateway/state.json`。想換位置，就設定 `conversations.state_file`。
+
+接回去的方式看還剩下什麼：
+
+- **tab 還在**：正常停掉 server（Ctrl-C 或 SIGTERM）時，背後的 tab 會留著。下次啟動照 tab 名稱
+  （`oa:<model id>:<6 位十六進位>`）認回來，之後只送新的訊息。server 之後沒再啟動的話，這些 tab 要自己關。
+- **herdr 也重啟過**：herdr 會保留 tab 名稱，但不保留名牌，所以 server 一樣照名稱認回來，再重新貼上名牌。
+  tab 裡的 CLI 已經不在，巡航會在同一個 pane 用 `--resume`／`resume` 把它叫回來。
+- **tab 不見了**（被手動關掉，或整個 workspace 都沒了）：下一個請求會開新 tab，用存下來的 session id 跑
+  `--resume`／`resume`，接回 CLI 自己的 context，一樣只送新的訊息。接不回來的話這個請求會失敗；再送一次，
+  就改成開新 agent、重播歷史。
+
+幾個容易踩的坑：
+
+- 一份狀態檔只給一個 server 用，第二個 server 指到同一份檔案會拒絕啟動。要同時跑兩個 server，請各自設定
+  `conversations.state_file`。其中一個停機超過 90 秒的話，它留下的 tab 名牌會失效，另一個 server 會把這些
+  tab 當成孤兒清掉。
+- server 在 turn 跑到一半時當掉，那則訊息還沒記進狀態檔。client 重送時，agent 可能會收到同一則訊息兩次。
+- 改了 listen port 的話，重啟前就在跑的 Claude 還是會把提問 hook 送到舊的 port。
+
 ## 搭配 opencode
 
 在 `opencode.json` 加上這段：

@@ -91,6 +91,8 @@ pub struct ConversationsConfig {
     pub idle_ttl_secs: u64,
     pub max_agents_per_model: usize,
     pub max_agents_total: usize,
+    /// Where conversations are kept across restarts; unset means `default_state_path`.
+    pub state_file: Option<PathBuf>,
 }
 
 impl Default for ConversationsConfig {
@@ -99,6 +101,7 @@ impl Default for ConversationsConfig {
             idle_ttl_secs: 1800,
             max_agents_per_model: 3,
             max_agents_total: 8,
+            state_file: None,
         }
     }
 }
@@ -451,6 +454,20 @@ where
         None => PathBuf::from(env("HOME").unwrap_or_default()).join(".config"),
     };
     base.join("herdr-openai-gateway").join("config.toml")
+}
+
+/// Resolve the default state file: `$XDG_STATE_HOME|~/.local/state` + `herdr-openai-gateway/state.json`.
+pub fn default_state_path<F>(env: F) -> PathBuf
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let base = match env("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(env("HOME").unwrap_or_default())
+            .join(".local")
+            .join("state"),
+    };
+    base.join("herdr-openai-gateway").join("state.json")
 }
 
 /// Expand a leading `~` or `~/` against the given home directory.

@@ -26,6 +26,7 @@ use crate::openai::{
 use crate::prompt;
 use crate::prompt::bridge::{self, BridgeChanges};
 use crate::question_hook::{self, HookAnswer, HookInput};
+use crate::state::{SavedAgent, SavedConversation, SavedState, StateFile};
 use crate::toolcall;
 use crate::transcript::{codex, StopKind};
 
@@ -186,6 +187,9 @@ pub struct ChatOutcome {
 enum TurnJob {
     /// New or Fork: the backing agent does not exist yet; the task spawns it.
     SpawnNew,
+    /// Continue after a restart that lost the tab: a new tab resumes the CLI's
+    /// saved session, so the prompt is only the delta.
+    ResumeNew { session: String },
     /// Continue: an existing handle; awaited to ready when `ready == false`.
     /// Boxed so the handle does not inflate the turn enums.
     RunExisting { agent: Box<AgentHandle> },
@@ -300,6 +304,13 @@ pub struct Service<H: HerdrApi> {
     /// request that arrives during that window is refused instead of touching
     /// the same pane from underneath the patrol.
     patrol_busy: Mutex<BTreeSet<ConversationId>>,
+    /// Where the conversations are kept across restarts; None keeps them in memory only.
+    state: Option<StateFile>,
+    /// Saved tabs of restored conversations, taken over by `startup_sweep`.
+    adopt_pending: Mutex<Vec<(ConversationId, SavedAgent)>>,
+    /// CLI session ids of restored conversations whose tab is gone; the next
+    /// request resumes the session in a new tab instead of replaying.
+    resume_sessions: Mutex<BTreeMap<ConversationId, String>>,
 }
 
 struct HookRequestGuard<'a, H: HerdrApi> {
@@ -344,6 +355,28 @@ impl<H: HerdrApi> Drop for HookRequestGuard<'_, H> {
 
 impl<H: HerdrApi> Service<H> {
     pub fn new(config: Config, herdr: Arc<H>, env: ServiceEnv) -> Arc<Self> {
+        Self::build(config, herdr, env, None, None)
+    }
+
+    /// A service that saves its conversations to `state` and starts from `saved`,
+    /// the state an earlier run left behind.
+    pub fn with_state(
+        config: Config,
+        herdr: Arc<H>,
+        env: ServiceEnv,
+        state: StateFile,
+        saved: Option<SavedState>,
+    ) -> Arc<Self> {
+        Self::build(config, herdr, env, Some(state), saved)
+    }
+
+    fn build(
+        config: Config,
+        herdr: Arc<H>,
+        env: ServiceEnv,
+        state: Option<StateFile>,
+        saved: Option<SavedState>,
+    ) -> Arc<Self> {
         let turn_limits = TurnLimits {
             turn_timeout_ms: config.herdr.turn_timeout_ms,
             blocked_timeout_ms: config.herdr.blocked_timeout_ms,
@@ -395,6 +428,35 @@ impl<H: HerdrApi> Service<H> {
                 (model.id.clone(), roots)
             })
             .collect();
+        let mut registry = Registry::default();
+        let mut adopt_pending = Vec::new();
+        let mut resume_sessions = BTreeMap::new();
+        let now = Instant::now();
+        for conversation in saved.iter().flat_map(|saved| &saved.conversations) {
+            if !config
+                .models
+                .iter()
+                .any(|model| model.id == conversation.model_id)
+            {
+                tracing::info!(
+                    model = %conversation.model_id,
+                    "dropping a saved conversation of a model no longer offered"
+                );
+                continue;
+            }
+            let id = registry.create(
+                &conversation.model_id,
+                conversation.key.clone(),
+                conversation.cwd.clone(),
+                now,
+            );
+            registry.restore_progress(id, conversation.user_digests.clone(), conversation.consumed);
+            if let Some(agent) = &conversation.agent {
+                adopt_pending.push((id, agent.clone()));
+            } else if let Some(session) = &conversation.resume_session {
+                resume_sessions.insert(id, session.clone());
+            }
+        }
         Arc::new(Self {
             config,
             herdr,
@@ -405,16 +467,21 @@ impl<H: HerdrApi> Service<H> {
                 .map(|since| since.as_secs() as u32)
                 .unwrap_or(0),
             transcript_roots,
-            registry: Mutex::new(Registry::default()),
+            registry: Mutex::new(registry),
             agents: Mutex::new(BTreeMap::new()),
             bridge_sent: Mutex::new(BTreeMap::new()),
             inflight: Mutex::new(BTreeMap::new()),
             clients: Mutex::new(BTreeMap::new()),
             workspace_id: Mutex::new(None),
-            owner_id: Uuid::new_v4().to_string(),
+            owner_id: saved
+                .map(|saved| saved.owner_id)
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
             untagged_tabs: Mutex::new(BTreeSet::new()),
             patrol_missing: Mutex::new(BTreeSet::new()),
             patrol_busy: Mutex::new(BTreeSet::new()),
+            state,
+            adopt_pending: Mutex::new(adopt_pending),
+            resume_sessions: Mutex::new(resume_sessions),
         })
     }
 
@@ -902,6 +969,8 @@ impl<H: HerdrApi> Service<H> {
         close: Vec<AgentHandle>,
     ) -> Reserved {
         self.locked_bridge().remove(&id);
+        // A replayed CLI starts a session of its own; the saved one is stale.
+        self.locked_resume_sessions().remove(&id);
         // This CLI has seen nothing, so a later request must replay as well in
         // case this turn never gets through.
         registry.reset_consumed(id);
@@ -951,14 +1020,25 @@ impl<H: HerdrApi> Service<H> {
         delta: Vec<NormalizedMessage>,
         superseded: Option<Arc<TurnLock>>,
     ) -> Reserved {
-        let Some(agent) = self.locked_agents().get(&id).cloned() else {
-            // The record outlived its agent (a switch or respawn that failed to
-            // launch): rebuild it and replay, instead of failing every retry.
-            return self.reserve_rebuild(registry, req, digest, id, superseded);
-        };
         // No turn has ever completed on this record (startup blocked or a
         // failed first turn): replay the full first prompt, not a delta.
         let ever_consumed = registry.get(id).is_some_and(|record| record.consumed > 0);
+        let agent = self.locked_agents().get(&id).cloned();
+        let job = match agent {
+            Some(agent) => TurnJob::RunExisting {
+                agent: Box::new(agent),
+            },
+            None => match ever_consumed
+                .then(|| self.locked_resume_sessions().remove(&id))
+                .flatten()
+            {
+                // A restart lost the tab, but the CLI's own session can come back.
+                Some(session) => TurnJob::ResumeNew { session },
+                // The record outlived its agent (a switch or respawn that failed
+                // to launch): rebuild it and replay, instead of failing every retry.
+                None => return self.reserve_rebuild(registry, req, digest, id, superseded),
+            },
+        };
         let bridge = self.model_mode(&req.model) == ModelMode::Bridge;
         let prompt_text = match (bridge, ever_consumed) {
             (true, true) => {
@@ -992,9 +1072,7 @@ impl<H: HerdrApi> Service<H> {
         Reserved::Start(StartPlan {
             id,
             prompt_text,
-            job: TurnJob::RunExisting {
-                agent: Box::new(agent),
-            },
+            job,
             new_record: false,
             tx,
             rx: Some(rx),
@@ -1284,6 +1362,7 @@ impl<H: HerdrApi> Service<H> {
                 lifecycle::close_agent(&*self.herdr, &handle, &self.owner_id).await;
             }
         }
+        self.save_state();
     }
 
     /// Patrol tick: keep every tracked conversation's CLI alive. An agent missing
@@ -1337,6 +1416,48 @@ impl<H: HerdrApi> Service<H> {
             self.restart_patrol_agent(id, handle).await;
         }
         *self.locked_patrol_missing() = seen;
+        self.save_state();
+    }
+
+    /// Write the conversations and their tabs to the state file, if there is one.
+    fn save_state(&self) {
+        let Some(state) = &self.state else {
+            return;
+        };
+        let mut saved = SavedState::new(
+            self.owner_id.clone(),
+            self.env
+                .question_hook
+                .as_ref()
+                .map(|hook| hook.token.clone()),
+        );
+        {
+            let registry = self.locked_registry();
+            let agents = self.locked_agents();
+            let resume_sessions = self.locked_resume_sessions();
+            saved.conversations = registry
+                .records()
+                .map(|record| SavedConversation {
+                    key: record.key.clone(),
+                    model_id: record.model_id.clone(),
+                    cwd: record.cwd.clone(),
+                    user_digests: record.user_digests.clone(),
+                    consumed: record.consumed,
+                    resume_session: resume_sessions.get(&record.id).cloned(),
+                    agent: agents.get(&record.id).map(|handle| SavedAgent {
+                        name: handle.name.clone(),
+                        pane_id: handle.pane_id.clone(),
+                        tab_id: handle.tab_id.clone(),
+                        tab_label: handle.tab_label.clone(),
+                        workspace_id: handle.workspace_id.clone(),
+                        session_id: handle.session_id.clone(),
+                        ready: handle.ready,
+                        managed: handle.managed,
+                    }),
+                })
+                .collect();
+        }
+        state.save(&saved);
     }
 
     /// The handle currently registered for a conversation, if any.
@@ -1455,7 +1576,8 @@ impl<H: HerdrApi> Service<H> {
         }
     }
 
-    /// Close `oa:` tabs left over from a previous run; never creates the workspace.
+    /// Take over the tabs the saved state names, then close the other `oa:` tabs
+    /// left over from a previous run; never creates the workspace.
     pub async fn startup_sweep(&self) {
         let workspaces = match self.herdr.workspace_list().await {
             Ok(workspaces) => workspaces,
@@ -1468,12 +1590,109 @@ impl<H: HerdrApi> Service<H> {
             .iter()
             .find(|ws| ws.label == self.config.herdr.workspace_label)
         else {
+            // No workspace, so none of the saved tabs survived: resume them all.
+            for (id, saved) in std::mem::take(&mut *lock(&self.adopt_pending)) {
+                if let Some(session) = saved.session_id {
+                    self.locked_resume_sessions().insert(id, session);
+                }
+            }
+            self.save_state();
             return;
         };
+        if self.state.is_some() {
+            self.adopt_saved_agents(&workspace.workspace_id).await;
+        }
         let closed =
             lifecycle::sweep_orphans(&*self.herdr, &workspace.workspace_id, &self.owner_id).await;
         if closed > 0 {
             tracing::info!(closed, "closed orphan backing tabs from a previous run");
+        }
+        self.save_state();
+    }
+
+    /// Re-attach restored conversations to their tabs, found by label: herdr keeps
+    /// tab labels across its own restarts, but not pane tokens. A conversation
+    /// whose tab is gone stays without an agent; the next request opens one.
+    async fn adopt_saved_agents(&self, workspace_id: &str) {
+        let pending = std::mem::take(&mut *lock(&self.adopt_pending));
+        let (tabs, panes) = match (
+            self.herdr.tab_list(workspace_id).await,
+            self.herdr.pane_list(workspace_id).await,
+        ) {
+            (Ok(tabs), Ok(panes)) => (tabs, panes),
+            (Err(err), _) | (_, Err(err)) => {
+                tracing::warn!("cannot adopt saved backing tabs: {err}");
+                return;
+            }
+        };
+        let owner_of = |tab_id: &str| {
+            panes
+                .iter()
+                .filter(|pane| pane.tab_id == tab_id)
+                .find_map(|pane| pane.tokens.get(lifecycle::OWNER_TOKEN_KEY))
+        };
+        let mut adopted = BTreeSet::new();
+        for (id, saved) in pending {
+            let Some(tab) = tabs.iter().find(|tab| tab.label == saved.tab_label) else {
+                tracing::info!(
+                    tab_label = %saved.tab_label,
+                    "a saved backing tab is gone; the next request opens a new one"
+                );
+                if let Some(session) = saved.session_id {
+                    self.locked_resume_sessions().insert(id, session);
+                }
+                continue;
+            };
+            let Some(pane) = panes.iter().find(|pane| pane.tab_id == tab.tab_id) else {
+                continue;
+            };
+            if owner_of(&tab.tab_id).is_some_and(|owner| *owner != self.owner_id) {
+                tracing::info!(tab_label = %saved.tab_label, "a saved backing tab now belongs to another instance");
+                continue;
+            }
+            let Some((model_id, cwd)) = self
+                .locked_registry()
+                .get(id)
+                .map(|record| (record.model_id.clone(), record.cwd.clone()))
+            else {
+                continue;
+            };
+            let Some(model) = self.config.models.iter().find(|model| model.id == model_id) else {
+                continue;
+            };
+            if let Err(err) =
+                lifecycle::report_owner_token(&*self.herdr, &pane.pane_id, &self.owner_id).await
+            {
+                tracing::warn!(pane_id = %pane.pane_id, "owner token report failed on adopt: {err}");
+            }
+            let handle = AgentHandle {
+                name: saved.name,
+                kind: model.kind,
+                model_id,
+                pane_id: pane.pane_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                tab_label: saved.tab_label,
+                workspace_id: workspace_id.to_string(),
+                cwd,
+                session_id: saved.session_id,
+                transcript: None,
+                ready: saved.ready,
+                managed: saved.managed,
+            };
+            tracing::info!(name = %handle.name, tab_label = %handle.tab_label, "adopted a backing tab");
+            adopted.insert(handle.tab_id.clone());
+            self.locked_agents().insert(id, handle);
+        }
+        // A tab the previous run owned that nobody took over would keep our
+        // token, and so escape every sweep, for as long as we run.
+        for tab in &tabs {
+            if tab.label.starts_with(lifecycle::TAB_LABEL_PREFIX)
+                && !adopted.contains(&tab.tab_id)
+                && owner_of(&tab.tab_id).is_some_and(|owner| *owner == self.owner_id)
+            {
+                tracing::info!(tab_label = %tab.label, "closing a backing tab no saved conversation uses");
+                let _ = self.herdr.tab_close(&tab.tab_id).await;
+            }
         }
     }
 
@@ -1542,6 +1761,11 @@ impl<H: HerdrApi> Service<H> {
     /// Close every backing agent tab this service owns.
     pub async fn shutdown(&self) {
         self.locked_clients().clear();
+        if self.state.is_some() {
+            // The tabs stay up for the next run to adopt from the state file.
+            self.save_state();
+            return;
+        }
         let owned = std::mem::take(&mut *self.locked_agents());
         for handle in owned.into_values() {
             lifecycle::close_agent(&*self.herdr, &handle, &self.owner_id).await;
@@ -1757,6 +1981,78 @@ impl<H: HerdrApi> Service<H> {
         }
     }
 
+    /// Open a new tab on the record's cwd and resume `session` in it.
+    async fn resume_agent_in_new_tab(
+        &self,
+        id: ConversationId,
+        session: &str,
+    ) -> Result<AgentHandle, LaunchError> {
+        let Some((cwd, model_id)) = self
+            .locked_registry()
+            .get(id)
+            .map(|record| (record.cwd.clone(), record.model_id.clone()))
+        else {
+            return Err(LaunchError::Failed(ApiError::backing_agent_exited(
+                "the backing agent exited and cannot be respawned",
+            )));
+        };
+        let Some(model) = self.config.models.iter().find(|model| model.id == model_id) else {
+            return Err(LaunchError::Failed(ApiError::backing_agent_exited(
+                "the backing agent exited and cannot be respawned",
+            )));
+        };
+        let workspace_id = self.ensure_workspace().await.map_err(LaunchError::Failed)?;
+        let extras = self.launch_extras(model);
+        let mut handle = lifecycle::open_backing_tab(
+            &*self.herdr,
+            &workspace_id,
+            model,
+            &cwd,
+            &extras,
+            &self.owner_id,
+        )
+        .await
+        .map_err(|err| LaunchError::Failed(err.into_api_error()))?;
+        handle.session_id = Some(session.to_string());
+        let resumed = lifecycle::restart_agent_in_place(
+            &*self.herdr,
+            &mut handle,
+            model,
+            self.config.herdr.startup_timeout_ms,
+            &extras,
+            Some(session),
+            &self.owner_id,
+        )
+        .await;
+        match resumed {
+            Ok(()) => {
+                if self.register_agent_or_close(id, &handle).await {
+                    Ok(handle)
+                } else {
+                    Err(LaunchError::Failed(ApiError::backing_agent_exited(
+                        "the backing agent exited and cannot be respawned",
+                    )))
+                }
+            }
+            Err(SpawnError::StartupBlocked { .. }) => {
+                if self.register_agent_or_close(id, &handle).await {
+                    Err(LaunchError::Blocked { handle })
+                } else {
+                    Err(LaunchError::Failed(ApiError::backing_agent_exited(
+                        "the backing agent exited and cannot be respawned",
+                    )))
+                }
+            }
+            Err(err) => {
+                // Typing the command failed before any wait could close the tab.
+                if matches!(err, SpawnError::Herdr(_)) {
+                    lifecycle::close_agent(&*self.herdr, &handle, &self.owner_id).await;
+                }
+                Err(LaunchError::Failed(err.into_api_error()))
+            }
+        }
+    }
+
     async fn ensure_workspace(&self) -> Result<String, ApiError> {
         if let Some(id) = self.locked_workspace().clone() {
             return Ok(id);
@@ -1792,6 +2088,9 @@ impl<H: HerdrApi> Service<H> {
                 // superseded must not clear the marker the newer request owns.
                 service.locked_registry().fail(id);
             }
+            // Saved before the client hears back, so a reply it holds is never
+            // missing from the state a restart starts from.
+            service.save_state();
             let _ = tx.send(TurnState::Done(result));
             service.clear_inflight(id, &tx);
         });
@@ -2431,6 +2730,17 @@ impl<H: HerdrApi> Service<H> {
                     return Err(err);
                 }
             },
+            TurnJob::ResumeNew { session } => {
+                match self.resume_agent_in_new_tab(id, &session).await {
+                    Ok(handle) => handle,
+                    Err(LaunchError::Blocked { handle }) => {
+                        self.resolve_startup_blocked(id, generation, handle, &plan.tx, &req, true)
+                            .await?
+                    }
+                    // The record stays; the next request rebuilds it and replays.
+                    Err(LaunchError::Failed(err)) => return Err(err),
+                }
+            }
             TurnJob::RunExisting { agent } => {
                 let mut agent = *agent;
                 if !agent.ready {
@@ -2756,6 +3066,10 @@ impl<H: HerdrApi> Service<H> {
 
     fn locked_patrol_busy(&self) -> MutexGuard<'_, BTreeSet<ConversationId>> {
         lock(&self.patrol_busy)
+    }
+
+    fn locked_resume_sessions(&self) -> MutexGuard<'_, BTreeMap<ConversationId, String>> {
+        lock(&self.resume_sessions)
     }
 
     fn locked_workspace(&self) -> MutexGuard<'_, Option<String>> {
