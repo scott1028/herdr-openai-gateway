@@ -1,0 +1,194 @@
+name: Release
+
+# Push to master releases v<Cargo.toml version> when that tag does not exist yet.
+# Manual runs release the selected branch, optionally under a custom tag.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (default: v<Cargo.toml version>, e.g. v0.1.0 or v0.1.0-rc.1)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# Queue runs so two pushes cannot release the same version twice.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      should_release: ${{ steps.plan.outputs.should_release }}
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Decide release tag
+        id: plan
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          RELEASE_TAG="${INPUT_TAG:-v$CARGO_VERSION}"
+          case "$RELEASE_TAG" in
+            "v$CARGO_VERSION" | "v$CARGO_VERSION".* | "v$CARGO_VERSION"-*) ;;
+            *)
+              echo "error: tag $RELEASE_TAG must start with v$CARGO_VERSION" >&2
+              exit 1
+              ;;
+          esac
+
+          SHOULD_RELEASE=true
+          if TAG_SHA=$(git rev-parse -q --verify "refs/tags/$RELEASE_TAG^{commit}"); then
+            if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+              echo "$RELEASE_TAG already exists; skip release"
+              SHOULD_RELEASE=false
+            elif [ "$TAG_SHA" != "$GITHUB_SHA" ]; then
+              echo "error: tag $RELEASE_TAG points to $TAG_SHA instead of $GITHUB_SHA" >&2
+              exit 1
+            fi
+          fi
+
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "should_release=$SHOULD_RELEASE" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+
+      - name: Test
+        run: cargo test --locked
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: herdr-openai-gateway-linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            name: herdr-openai-gateway-linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: herdr-openai-gateway-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: herdr-openai-gateway-macos-aarch64
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+
+      - name: Set Linux aarch64 linker
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package artifact
+        run: cp target/${{ matrix.target }}/release/herdr-openai-gateway ${{ matrix.name }}
+
+      # Only these two targets match their runner's CPU.
+      - name: Smoke test
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-apple-darwin'
+        run: ./${{ matrix.name }} --version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
+
+  release:
+    needs: [prepare, test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write checksums and release notes
+        working-directory: dist
+        run: |
+          sha256sum herdr-openai-gateway-* > SHA256SUMS
+          cat SHA256SUMS
+          cat > "$RUNNER_TEMP/RELEASE_NOTES.md" <<EOF
+          Built from \`$GITHUB_SHA\`.
+
+          - \`herdr-openai-gateway-linux-<arch>\`: static Linux binary.
+          - \`herdr-openai-gateway-macos-<arch>\`: macOS binary.
+
+          \`chmod +x\` the file and put it on \`PATH\` as \`herdr-openai-gateway\`.
+          EOF
+
+      - name: Create release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            dist/herdr-openai-gateway-linux-x86_64
+            dist/herdr-openai-gateway-linux-aarch64
+            dist/herdr-openai-gateway-macos-x86_64
+            dist/herdr-openai-gateway-macos-aarch64
+            dist/SHA256SUMS
+          body_path: ${{ runner.temp }}/RELEASE_NOTES.md
+          fail_on_unmatched_files: true
