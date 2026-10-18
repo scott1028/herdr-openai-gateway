@@ -17,6 +17,8 @@ use crate::transcript::claude;
 
 /// Idle conversations are reaped on this cadence.
 const REAPER_INTERVAL: Duration = Duration::from_secs(30);
+/// Dead backing agents are restarted on this cadence.
+const PATROL_INTERVAL: Duration = Duration::from_secs(10);
 /// Tracked OpenCode clients are checked on this cadence.
 const CLIENT_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -157,6 +159,15 @@ pub async fn serve(args: ServeArgs) -> ExitCode {
             }
         }
     });
+    let patrol = tokio::spawn({
+        let service = Arc::clone(&service);
+        async move {
+            loop {
+                tokio::time::sleep(PATROL_INTERVAL).await;
+                service.patrol_agents().await;
+            }
+        }
+    });
     let client_checker = tokio::spawn({
         let service = Arc::clone(&service);
         async move {
@@ -179,6 +190,7 @@ pub async fn serve(args: ServeArgs) -> ExitCode {
     })
     .await;
     reaper.abort();
+    patrol.abort();
     client_checker.abort();
     let failed = match &result {
         Ok(()) => false,

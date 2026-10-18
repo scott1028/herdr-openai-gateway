@@ -149,6 +149,11 @@ key 裡面不含 model，所以同一把 key 永遠落在同一段對話。中�
 
 - 對話閒置超過 `conversations.idle_ttl_secs`，它的 agent 會被關掉。下一個請求進來時再重新開一個，並重播
   歷史。
+- 背後的 CLI 自己掛掉時，每 10 秒一次的 **agent 巡航**會在**同一個 pane** 裡把它重起起來，並用
+  `--resume`／`resume` 救回它自己的 context；pane 也不見了才開新 tab。同一段對話重起 3 次之後巡航就
+  停手，也會關掉那個 tab、不再追蹤，等下一個請求再試。重起期間送來的訊息會拿到 409
+  `conversation_busy`，等它起來再送一次；同一則訊息重送則直接拿到快取的回覆。這段期間對話 key、cwd、
+  歷史都不變。
 - `max_agents_per_model` 和 `max_agents_total` 限制同時活著的 agent 數量。超過時，最久沒用的對話先被請走。
 - 一段對話同一時間只做一件事。上一個 turn 還沒結束又送來新請求，會拿到 409 `conversation_busy`。例外是
   上一個 client 已經自己掛斷了（例如在 opencode 按 Esc）：這時新請求會接手，agent 先收到一個 `esc`；
@@ -163,7 +168,7 @@ key 裡面不含 model，所以同一把 key 永遠落在同一段對話。中�
 每個背後的 pane 都會貼一張「名牌」：一個叫 `oa_owner` 的 herdr metadata token，寫著是哪個 server
 instance 開的。名牌每 30 秒更新一次，最後一次更新後 90 秒沒續就失效。
 
-清理殘留的 `oa:` tab 時（啟動時，以及每次定期巡邏），只要看到名牌寫的是另一個還活著的 instance，就
+清理殘留的 `oa:` tab 時（啟動時，以及每 30 秒的 tab 清理），只要看到名牌寫的是另一個還活著的 instance，就
 不會動它。所以兩個 server 可以放心共用同一個 herdr session。
 
 ## 搭配 opencode
@@ -294,7 +299,7 @@ server 絕對不會替你按。它會把對話框轉到 client 讓你自己選�
 | `cwd_not_allowed` | 403 | cwd 不存在，或不在 `allowed_cwd_roots` 底下；訊息會告訴你路徑從哪來（`X-Herdr-Cwd`、client 的 `Working directory`、model 的 `cwd` 或 `defaults.cwd`） |
 | `origin_not_allowed` | 403 | `Host` / `Origin` 不被允許 |
 | `model_not_found` | 404 | 沒有這個 model id |
-| `conversation_busy` | 409 | 這段對話還有 turn 在跑 |
+| `conversation_busy` | 409 | 這段對話還有 turn 在跑，或巡航正在換掉它的 agent |
 | `conversation_side_request` | 409 | 對聊天對話送了附帶請求，請設定 `small_model`。如果送來時剛好有 turn 在跑，會改回 `conversation_busy` |
 | `too_many_backing_agents` | 429 | agent 數量到上限了 |
 | `backing_agent_exited` | 502 | agent 做到一半掛了，請重送 |

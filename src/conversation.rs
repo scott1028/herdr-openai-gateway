@@ -14,6 +14,9 @@ use crate::question_hook::HookAnswer;
 const RETRY_WINDOW: Duration = Duration::from_secs(600);
 /// LRU eviction only considers conversations idle for at least this long.
 const EVICT_MIN_IDLE: Duration = Duration::from_secs(60);
+/// Patrol restarts one conversation may burn before the patrol gives up on it
+/// and leaves the next client request to try again.
+pub const RESTART_FUSE_LIMIT: u32 = 3;
 
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
@@ -111,6 +114,9 @@ pub struct ConversationRecord {
     /// Bumped whenever an in-flight turn is superseded; a turn task whose
     /// generation is older must not commit or fail the record.
     pub generation: u64,
+    /// Patrol restarts attempted since the last turn that got through. At
+    /// `RESTART_FUSE_LIMIT` the patrol stops and leaves it to the next request.
+    pub patrol_restarts: u32,
     /// Number of dialog relays published for this conversation. Only ever
     /// increases: `answer_dialog` takes the pending entry out, but the next
     /// relay must still carry a higher seq for the answering request to see it.
@@ -362,6 +368,7 @@ impl Registry {
                 inflight_users: Vec::new(),
                 inflight_count: 0,
                 generation: 0,
+                patrol_restarts: 0,
                 dialog_seq: 0,
                 pending_dialog: None,
                 created: now,
@@ -430,6 +437,8 @@ impl Registry {
             record.user_digests = std::mem::take(&mut record.inflight_users);
             record.consumed = record.inflight_count + 1;
             record.inflight_count = 0;
+            // A turn that got through: the crash-loop fuse starts over.
+            record.patrol_restarts = 0;
             record.last_request = record.inflight.take();
             record.last_reply = Some(reply);
             record.last_reply_at = Some(now);
@@ -442,6 +451,17 @@ impl Registry {
             }
             record.last_used = now;
         }
+    }
+
+    /// Count one patrol restart of this conversation and report whether its fuse
+    /// has blown: after `RESTART_FUSE_LIMIT` restarts the patrol stops touching
+    /// it and the next client request takes over.
+    pub fn note_patrol_restart(&mut self, id: ConversationId) -> bool {
+        let Some(record) = self.records.get_mut(&id) else {
+            return true;
+        };
+        record.patrol_restarts += 1;
+        record.patrol_restarts > RESTART_FUSE_LIMIT
     }
 
     /// Record the digests without a reply so the same user message is never re-sent.
@@ -754,6 +774,27 @@ mod tests {
 
     fn cwd() -> PathBuf {
         PathBuf::from("/tmp/project")
+    }
+
+    #[test]
+    fn patrol_restart_fuse_blows_after_three_and_a_commit_clears_it() {
+        let now = base();
+        let mut registry = Registry::default();
+        let id = registry.create("claude", Some("k1".to_string()), cwd(), now);
+        let blown: Vec<bool> = (0..4).map(|_| registry.note_patrol_restart(id)).collect();
+        assert_eq!(
+            blown,
+            vec![false, false, false, true],
+            "three restarts are allowed, the next sighting stops the patrol"
+        );
+        let first = req("claude", Some("k1"), vec![user("hello")]);
+        registry.begin(id, request_digest(&first), &first);
+        registry.commit(id, reply("hi"), now);
+        assert_eq!(registry.get(id).expect("record").patrol_restarts, 0);
+        assert!(
+            !registry.note_patrol_restart(id),
+            "a turn that got through starts the fuse over"
+        );
     }
 
     #[test]

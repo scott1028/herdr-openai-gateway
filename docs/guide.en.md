@@ -172,6 +172,12 @@ Other rules:
 
 - When a conversation sits idle longer than `conversations.idle_ttl_secs`, its agent is closed.
   The next request opens a new one and replays the history.
+- If the backing CLI dies on its own, a 10-second **agent patrol** restarts it inside the **same
+  pane** and recovers its own context with `--resume`／`resume`; only when the pane is gone too does a
+  new tab open. After three restarts the patrol lets go of the conversation, closes that tab and stops
+  tracking it, leaving it to the next request. A message sent while the restart is running gets 409
+  `conversation_busy`; send it again once the CLI is up, while resending the same message is answered
+  from the cache. The conversation key, the cwd, and the history stay put throughout.
 - `max_agents_per_model` and `max_agents_total` limit how many agents are alive at once. When the
   limit is hit, the conversation unused the longest is asked to leave first.
 - A conversation does one thing at a time. A new request that arrives before the previous turn
@@ -192,7 +198,7 @@ Every pane behind the scenes wears a "name tag": a herdr metadata token called `
 says which server instance opened it. The tag is renewed every 30 seconds and expires 90 seconds
 after the last renewal.
 
-When leftover `oa:` tabs are cleaned up (at startup and on every regular patrol), any tab whose tag
+When leftover `oa:` tabs are cleaned up (at startup and on the 30-second tab sweep), any tab whose tag
 names another live instance is left alone. So two servers can safely share one herdr session.
 
 ## Using it with opencode
@@ -335,7 +341,7 @@ stream has started, an error event is sent first, then `[DONE]`.
 | `cwd_not_allowed` | 403 | the cwd does not exist or is not under `allowed_cwd_roots`; the message tells you where the path came from (`X-Herdr-Cwd`, the client's `Working directory`, the model's `cwd`, or `defaults.cwd`) |
 | `origin_not_allowed` | 403 | `Host` / `Origin` not allowed |
 | `model_not_found` | 404 | no such model id |
-| `conversation_busy` | 409 | a turn is still running in this conversation |
+| `conversation_busy` | 409 | a turn is still running in this conversation, or the patrol is replacing its agent |
 | `conversation_side_request` | 409 | a side request sent to a chat conversation; set `small_model`. If a turn happens to be running when it arrives, you get `conversation_busy` instead |
 | `too_many_backing_agents` | 429 | the agent limit is reached |
 | `backing_agent_exited` | 502 | the agent died halfway; please resend |

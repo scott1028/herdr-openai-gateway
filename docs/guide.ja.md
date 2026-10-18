@@ -165,6 +165,12 @@ opencode プロセスを探します。そのプロセスが終了すると、�
 
 - 会話が `conversations.idle_ttl_secs` より長く放置されると、その agent は閉じられます。次のリクエストが
   来たときに新しく開き直し、履歴を再生します。
+- 裏で動いている CLI が自分で落ちても、10 秒ごとの **agent 巡回**が同じ pane の中で再起動し、
+  `--resume`／`resume` でその CLI 自身の context を救い戻します。pane まで無くなっていなければ新しい
+  tab は開きません。再起動を 3 回やったら巡回はその会話を手放し、その tab を閉じて追跡もやめ、次の
+  リクエストに任せます。再起動中に送られたメッセージは 409 `conversation_busy` が返るので、CLI が
+  立ち上がってから送り直してください。同じメッセージの送り直しなら、キャッシュから即答します。その間、
+  会話キー・cwd・履歴は変わりません。
 - `max_agents_per_model` と `max_agents_total` で、同時に動く agent の数を制限します。上限に達すると、
   いちばん長く使われていない会話から退場してもらいます。
 - 1 つの会話が一度にこなす仕事は 1 つだけです。前の turn が終わる前に新しいリクエストが来ると、409
@@ -184,7 +190,7 @@ opencode プロセスを探します。そのプロセスが終了すると、�
 `oa_owner` という herdr metadata token です。名札は 30 秒ごとに更新され、最後の更新から 90 秒たつと
 無効になります。
 
-残った `oa:` tab を片付けるとき（起動時と、定期的な見回りのたび）、名札に別の生きているインスタンスの
+残った `oa:` tab を片付けるとき（起動時と、30 秒ごとの tab 見回り）、名札に別の生きているインスタンスの
 名前があれば、その tab には手を出しません。なので、2 つのサーバーで 1 つの herdr セッションを安心して
 共有できます。
 
@@ -329,7 +335,7 @@ error イベントを送り、そのあと `[DONE]` を送ります。
 | `cwd_not_allowed` | 403 | cwd が存在しないか、`allowed_cwd_roots` の下にない。パスがどこから来たか（`X-Herdr-Cwd`、クライアントの `Working directory`、model の `cwd`、`defaults.cwd`）をメッセージが教えてくれる |
 | `origin_not_allowed` | 403 | `Host` / `Origin` が許可されていない |
 | `model_not_found` | 404 | その model id はない |
-| `conversation_busy` | 409 | この会話でまだ turn が動いている |
+| `conversation_busy` | 409 | この会話でまだ turn が動いているか、巡回がその agent を差し替えている |
 | `conversation_side_request` | 409 | チャットの会話に付随リクエストが送られた。`small_model` を設定してください。届いたときにちょうど turn が動いていれば、代わりに `conversation_busy` が返る |
 | `too_many_backing_agents` | 429 | agent の数が上限に達した |
 | `backing_agent_exited` | 502 | agent が途中で止まった。送り直してください |

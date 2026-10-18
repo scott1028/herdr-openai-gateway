@@ -292,6 +292,14 @@ pub struct Service<H: HerdrApi> {
     owner_id: String,
     /// `oa:` tabs the previous periodic sweep saw without an owner token.
     untagged_tabs: Mutex<BTreeSet<String>>,
+    /// Conversations the previous patrol tick found without a live agent. The
+    /// patrol acts on the second sighting in a row, so one odd `agent.get`
+    /// answer never types into a live pane.
+    patrol_missing: Mutex<BTreeSet<ConversationId>>,
+    /// Conversations whose backing CLI the patrol is replacing right now. A
+    /// request that arrives during that window is refused instead of touching
+    /// the same pane from underneath the patrol.
+    patrol_busy: Mutex<BTreeSet<ConversationId>>,
 }
 
 struct HookRequestGuard<'a, H: HerdrApi> {
@@ -308,6 +316,19 @@ impl<H: HerdrApi> HookRequestGuard<'_, H> {
             self.pause.finish();
             self.finished = true;
         }
+    }
+}
+
+/// Holds the patrol's claim on one conversation for the length of a restart, so a
+/// panic inside the restart cannot leave every later request answering 409.
+struct PatrolClaim<'a, H: HerdrApi> {
+    service: &'a Service<H>,
+    id: ConversationId,
+}
+
+impl<H: HerdrApi> Drop for PatrolClaim<'_, H> {
+    fn drop(&mut self) {
+        self.service.locked_patrol_busy().remove(&self.id);
     }
 }
 
@@ -392,6 +413,8 @@ impl<H: HerdrApi> Service<H> {
             workspace_id: Mutex::new(None),
             owner_id: Uuid::new_v4().to_string(),
             untagged_tabs: Mutex::new(BTreeSet::new()),
+            patrol_missing: Mutex::new(BTreeSet::new()),
+            patrol_busy: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -779,9 +802,15 @@ impl<H: HerdrApi> Service<H> {
                 }
             }
             Classification::Continue { id, delta } => {
+                if self.patrol_is_restarting(id) {
+                    return Reserved::Finished(Err(Self::patrol_busy_error()));
+                }
                 self.reserve_continue(&mut registry, req, &digest, id, delta, superseded)
             }
             Classification::ModelSwitch(id) => {
+                if self.patrol_is_restarting(id) {
+                    return Reserved::Finished(Err(Self::patrol_busy_error()));
+                }
                 self.reserve_model_switch(&mut registry, req, &digest, id, superseded)
             }
         }
@@ -1257,6 +1286,175 @@ impl<H: HerdrApi> Service<H> {
         }
     }
 
+    /// Patrol tick: keep every tracked conversation's CLI alive. An agent missing
+    /// on two ticks in a row is restarted inside its own pane; when the pane is
+    /// gone as well, a new tab opens on the record's cwd. A conversation with a
+    /// turn in flight is never touched, and one that crash-loops is left to the
+    /// next client request. The threadId mapping is untouched in every branch.
+    pub async fn patrol_agents(&self) {
+        let tracked: Vec<ConversationId> = self.locked_agents().keys().copied().collect();
+        let seen_before = self.locked_patrol_missing().clone();
+        let mut seen = BTreeSet::new();
+        for id in tracked {
+            if self.locked_inflight().contains_key(&id) || self.locked_patrol_busy().contains(&id) {
+                // A turn owns this agent right now, or a restart of it is running.
+                continue;
+            }
+            let Some(checked) = self.agents_handle(&id) else {
+                continue;
+            };
+            if !self.agent_is_gone(&checked).await {
+                continue;
+            }
+            seen.insert(id);
+            if !seen_before.contains(&id) {
+                // First sighting: one more tick rules out a transient answer.
+                continue;
+            }
+            // One tick can spend tens of seconds restarting one agent, so the map is
+            // read again here: a client turn may already have moved this conversation
+            // to another pane while we were looking at the others.
+            let handle = match self.agents_handle(&id) {
+                Some(handle)
+                    if handle.pane_id == checked.pane_id && handle.name == checked.name =>
+                {
+                    handle
+                }
+                _ => continue,
+            };
+            // Claim the conversation for the whole restart. `reserve` tests the claim
+            // while it holds the registry lock, so the in-flight check and the claim
+            // are taken under that same lock: either the request sees the claim and is
+            // refused, or the patrol sees the turn and steps back.
+            let _claim = {
+                let _registry = self.locked_registry();
+                if self.locked_inflight().contains_key(&id) {
+                    continue;
+                }
+                self.locked_patrol_busy().insert(id);
+                PatrolClaim { service: self, id }
+            };
+            self.restart_patrol_agent(id, handle).await;
+        }
+        *self.locked_patrol_missing() = seen;
+    }
+
+    /// The handle currently registered for a conversation, if any.
+    fn agents_handle(&self, id: &ConversationId) -> Option<AgentHandle> {
+        self.locked_agents().get(id).cloned()
+    }
+
+    /// Restart one agent the patrol found dead: inside its own pane while that
+    /// pane is still there, otherwise in a new tab on the record's cwd.
+    async fn restart_patrol_agent(&self, id: ConversationId, mut handle: AgentHandle) {
+        if self.locked_registry().get(id).is_none() {
+            // The conversation was reaped while we watched it. Close the tab: the
+            // reaper may not have reached it yet, and nobody else will.
+            self.patrol_lets_go(id, &handle).await;
+            return;
+        }
+        let workspace_id = match self.ensure_workspace().await {
+            Ok(workspace_id) => workspace_id,
+            Err(err) => {
+                tracing::warn!(name = %handle.name, "patrol cannot reach the workspace: {err}");
+                return;
+            }
+        };
+        let panes = match self.herdr.pane_list(&workspace_id).await {
+            Ok(panes) => panes,
+            Err(err) => {
+                tracing::warn!(pane_id = %handle.pane_id, "patrol could not list panes: {err}");
+                if matches!(&err, HerdrError::Api { code, .. } if code == "workspace_not_found") {
+                    // The cached workspace is gone; the next tick resolves it again.
+                    *self.locked_workspace() = None;
+                }
+                return;
+            }
+        };
+        // Only a tick that really restarts something spends fuse credit.
+        if self.locked_registry().get(id).is_none() {
+            tracing::info!(name = %handle.name, "the conversation was reaped; closing its tab");
+            self.patrol_lets_go(id, &handle).await;
+            return;
+        }
+        if self.locked_registry().note_patrol_restart(id) {
+            tracing::warn!(
+                name = %handle.name,
+                limit = conversation::RESTART_FUSE_LIMIT,
+                "the backing agent crash-looped; the next request will try again"
+            );
+            self.patrol_lets_go(id, &handle).await;
+            return;
+        }
+        // A dialog the dead agent relayed can never be answered by its
+        // replacement: expire it so a late answer gets the explanatory reply.
+        self.locked_registry().expire_dialog(id);
+        let resume = handle.session_id.clone();
+        let in_own_pane = panes.iter().any(|pane| pane.pane_id == handle.pane_id);
+        let outcome = if in_own_pane {
+            self.restart_agent_in_place_for(id, &mut handle, resume.as_deref())
+                .await
+        } else {
+            tracing::info!(name = %handle.name, "the backing pane is gone; opening a new tab");
+            match self.spawn_agent_for(id).await {
+                Ok(spawned) => {
+                    handle = spawned;
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            }
+        };
+        // Only a restart that handed the CLI its own session id keeps the
+        // conversation inside the CLI. A new tab, or a CLI with no session id to
+        // resume, starts blank and must be replayed by the next request.
+        let replay_needed = !in_own_pane || resume.is_none();
+        match outcome {
+            Ok(()) => {
+                if replay_needed {
+                    self.locked_registry().reset_consumed(id);
+                }
+                self.register_agent_or_close(id, &handle).await;
+            }
+            Err(LaunchError::Blocked { .. }) => {
+                // Already registered as not ready: the next request awaits this pane.
+                if replay_needed {
+                    self.locked_registry().reset_consumed(id);
+                }
+            }
+            Err(LaunchError::Failed(err)) => {
+                tracing::warn!(
+                    name = %handle.name,
+                    error = %err.message,
+                    "patrol could not restart the backing agent"
+                );
+                self.patrol_lets_go(id, &handle).await;
+            }
+        }
+    }
+
+    /// Stop watching a conversation the patrol cannot bring back, and close its tab:
+    /// a handle left in the map would keep refreshing the owner token, so the tab
+    /// would never be swept.
+    async fn patrol_lets_go(&self, id: ConversationId, handle: &AgentHandle) {
+        lifecycle::close_agent(&*self.herdr, handle, &self.owner_id).await;
+        self.locked_agents().remove(&id);
+    }
+
+    /// True when herdr reports no agent for both the handle's name and its pane:
+    /// the CLI is gone, though the pane may still be there. A transport error is
+    /// not evidence, so the caller keeps waiting.
+    async fn agent_is_gone(&self, handle: &AgentHandle) -> bool {
+        match self.herdr.agent_get(&handle.name).await {
+            Ok(_) => false,
+            Err(err) if !agent_gone(&err) => false,
+            // Mirror spawn polling: the name may lag the pane id.
+            Err(_) => match self.herdr.agent_get(&handle.pane_id).await {
+                Ok(_) => false,
+                Err(err) => agent_gone(&err),
+            },
+        }
+    }
+
     /// Close `oa:` tabs left over from a previous run; never creates the workspace.
     pub async fn startup_sweep(&self) {
         let workspaces = match self.herdr.workspace_list().await {
@@ -1376,6 +1574,20 @@ impl<H: HerdrApi> Service<H> {
         ApiError::conversation_busy(format!(
             "conversation {id} is processing another request; retry after it completes"
         ))
+    }
+
+    /// True while the patrol is replacing this conversation's backing CLI.
+    fn patrol_is_restarting(&self, id: ConversationId) -> bool {
+        self.locked_patrol_busy().contains(&id)
+    }
+
+    /// A request that arrives during that window is refused: the patrol may be
+    /// typing into the conversation's pane right now.
+    fn patrol_busy_error() -> ApiError {
+        ApiError::conversation_busy(
+            "the gateway is restarting this conversation's backing agent; send the message \
+             again",
+        )
     }
 
     /// Per-launch additions on top of the model spec: Claude's agent-view env and
@@ -2242,14 +2454,7 @@ impl<H: HerdrApi> Service<H> {
         let _turn_guard = plan.turn_lock.lock().await;
         // An agent that exited since the last turn is replaced inside its own
         // pane, resuming its session when the gateway knows the id.
-        let gone = match self.herdr.agent_get(&agent.name).await {
-            Ok(_) => false,
-            Err(HerdrError::Api { code, .. }) if code == "agent_not_found" => {
-                // Mirror spawn polling: the name may lag the pane id.
-                self.herdr.agent_get(&agent.pane_id).await.is_err()
-            }
-            Err(_) => false,
-        };
+        let gone = self.agent_is_gone(&agent).await;
         if gone {
             // The pane is still there, so put a new CLI in it instead of opening
             // another tab; resume restores the CLI's own context when its session
@@ -2543,6 +2748,14 @@ impl<H: HerdrApi> Service<H> {
 
     fn locked_inflight(&self) -> MutexGuard<'_, BTreeMap<ConversationId, InflightTurn>> {
         lock(&self.inflight)
+    }
+
+    fn locked_patrol_missing(&self) -> MutexGuard<'_, BTreeSet<ConversationId>> {
+        lock(&self.patrol_missing)
+    }
+
+    fn locked_patrol_busy(&self) -> MutexGuard<'_, BTreeSet<ConversationId>> {
+        lock(&self.patrol_busy)
     }
 
     fn locked_workspace(&self) -> MutexGuard<'_, Option<String>> {
@@ -4793,6 +5006,418 @@ mod tests {
             "the new CLI gets the full history"
         );
         assert!(prompts.last().expect("prompt").contains("after close"));
+        f.cleanup();
+    }
+
+    #[tokio::test]
+    async fn patrol_restarts_a_dead_agent_inside_its_pane() {
+        let f = Fixture::new(
+            Config::builtin(),
+            FakeHerdr::new()
+                .with_turns([ScriptedTurn::Reply("one".to_string()), ScriptedTurn::Exit]),
+        );
+        let first = f
+            .service
+            .chat(req("claude+agent-tools", Some("k1"), vec![user("hello")]))
+            .await
+            .expect("first chat");
+        let pane_id = f
+            .service
+            .locked_agents()
+            .get(&first.conversation)
+            .expect("agent")
+            .pane_id
+            .clone();
+        // The agent exits during this turn: the handle stays, the CLI is gone.
+        let err = f
+            .service
+            .chat(req(
+                "claude+agent-tools",
+                Some("k1"),
+                vec![user("hello"), assistant("one"), user("second")],
+            ))
+            .await
+            .expect_err("the agent exits mid-turn");
+        assert_eq!((err.status, err.code), (502, "backing_agent_exited"));
+
+        // The first sighting is only recorded: one odd answer never types into a pane.
+        f.service.patrol_agents().await;
+        assert!(
+            send_inputs(&f.fake).is_empty(),
+            "the first tick only watches"
+        );
+
+        f.service.patrol_agents().await;
+        let line = send_inputs(&f.fake).pop().expect("restart line").0;
+        assert!(
+            line.contains("--resume"),
+            "the patrol resumes the session: {line}"
+        );
+        assert_eq!(start_count(&f.fake), 1, "a patrol restart opens no new tab");
+        {
+            let agents = f.service.locked_agents();
+            let handle = agents.get(&first.conversation).expect("handle");
+            assert_eq!(handle.pane_id, pane_id, "the same pane hosts the new CLI");
+            assert!(handle.ready, "the patrol waits out readiness");
+        }
+        // The replacement resumed its own session, so it still holds the
+        // conversation: nothing is queued for replay, and the restart spent one
+        // unit of fuse credit.
+        let registry = f.service.locked_registry();
+        let record = registry.get(first.conversation).expect("record");
+        assert!(record.consumed > 0, "a resumed CLI is never replayed");
+        assert_eq!(
+            record.patrol_restarts, 1,
+            "the restart counts against the fuse"
+        );
+        drop(registry);
+        assert!(
+            f.service.locked_patrol_busy().is_empty(),
+            "the patrol releases its claim when the restart finishes"
+        );
+        f.cleanup();
+    }
+
+    #[tokio::test]
+    async fn patrol_restart_without_a_session_id_replays_the_history() {
+        let f = Fixture::new(
+            Config::builtin(),
+            FakeHerdr::new()
+                .with_turns([ScriptedTurn::Reply("one".to_string()), ScriptedTurn::Exit]),
+        );
+        let first = f
+            .service
+            .chat(req("claude+agent-tools", Some("k1"), vec![user("hello")]))
+            .await
+            .expect("first chat");
+        {
+            // The gateway never learned this CLI's session id.
+            let mut agents = f.service.locked_agents();
+            agents
+                .get_mut(&first.conversation)
+                .expect("agent")
+                .session_id = None;
+        }
+        let err = f
+            .service
+            .chat(req(
+                "claude+agent-tools",
+                Some("k1"),
+                vec![user("hello"), assistant("one"), user("second")],
+            ))
+            .await
+            .expect_err("the agent exits mid-turn");
+        assert_eq!((err.status, err.code), (502, "backing_agent_exited"));
+
+        f.service.patrol_agents().await;
+        f.service.patrol_agents().await;
+        let line = send_inputs(&f.fake).pop().expect("restart line").0;
+        assert!(
+            !line.contains("resume"),
+            "no session id means no resume flag: {line}"
+        );
+        assert_eq!(
+            f.service
+                .locked_registry()
+                .get(first.conversation)
+                .expect("record")
+                .consumed,
+            0,
+            "the next request replays the whole conversation to the fresh CLI"
+        );
+        f.cleanup();
+    }
+
+    #[tokio::test]
+    async fn patrol_opens_a_new_tab_when_the_pane_is_gone() {
+        let f = Fixture::new(
+            Config::builtin(),
+            FakeHerdr::new().with_turns([
+                ScriptedTurn::Reply("one".to_string()),
+                ScriptedTurn::Exit,
+                ScriptedTurn::Reply("two".to_string()),
+            ]),
+        );
+        let first = f
+            .service
+            .chat(req("claude+agent-tools", Some("k1"), vec![user("hello")]))
+            .await
+            .expect("first chat");
+        let tab_id = f
+            .service
+            .locked_agents()
+            .get(&first.conversation)
+            .expect("agent")
+            .tab_id
+            .clone();
+        let err = f
+            .service
+            .chat(req(
+                "claude+agent-tools",
+                Some("k1"),
+                vec![user("hello"), assistant("one"), user("second")],
+            ))
+            .await
+            .expect_err("the agent exits mid-turn");
+        assert_eq!((err.status, err.code), (502, "backing_agent_exited"));
+        // No pane left to restart into.
+        f.fake.tab_close(&tab_id).await.expect("close tab");
+
+        f.service.patrol_agents().await;
+        f.service.patrol_agents().await;
+        assert_eq!(
+            start_count(&f.fake),
+            2,
+            "a new tab hosts the patrol's restart"
+        );
+        {
+            let agents = f.service.locked_agents();
+            let handle = agents.get(&first.conversation).expect("handle");
+            assert_ne!(handle.tab_id, tab_id, "the conversation moved to a new tab");
+        }
+        assert_eq!(
+            f.service
+                .locked_registry()
+                .get(first.conversation)
+                .expect("record")
+                .model_id,
+            "claude+agent-tools",
+            "the threadId mapping is untouched"
+        );
+        // The new CLI resumed nothing, so it must be replayed from the start.
+        assert_eq!(
+            f.service
+                .locked_registry()
+                .get(first.conversation)
+                .expect("record")
+                .consumed,
+            0,
+            "a CLI in a new tab has seen none of this conversation"
+        );
+        let retry = f
+            .service
+            .chat(req(
+                "claude+agent-tools",
+                Some("k1"),
+                vec![user("hello"), assistant("one"), user("second")],
+            ))
+            .await
+            .expect("next request");
+        assert_eq!(retry.reply.text.as_deref(), Some("two"));
+        let prompts = prompt_calls(&f.fake);
+        assert!(
+            prompts
+                .last()
+                .expect("prompt")
+                .contains("Conversation so far:"),
+            "the next request replays the whole history to the new CLI"
+        );
+        f.cleanup();
+    }
+
+    #[tokio::test]
+    async fn patrol_gives_up_on_a_crash_looping_conversation() {
+        let f = Fixture::new(
+            Config::builtin(),
+            FakeHerdr::new()
+                .with_turns([ScriptedTurn::Reply("one".to_string()), ScriptedTurn::Exit]),
+        );
+        let first = f
+            .service
+            .chat(req("claude+agent-tools", Some("k1"), vec![user("hello")]))
+            .await
+            .expect("first chat");
+        let err = f
+            .service
+            .chat(req(
+                "claude+agent-tools",
+                Some("k1"),
+                vec![user("hello"), assistant("one"), user("second")],
+            ))
+            .await
+            .expect_err("the agent exits mid-turn");
+        assert_eq!((err.status, err.code), (502, "backing_agent_exited"));
+
+        // The fuse is already at its limit: the patrol leaves it to a client request.
+        {
+            let mut registry = f.service.locked_registry();
+            for _ in 0..conversation::RESTART_FUSE_LIMIT {
+                assert!(
+                    !registry.note_patrol_restart(first.conversation),
+                    "the limit itself still allows the restart"
+                );
+            }
+        }
+        f.service.patrol_agents().await;
+        f.service.patrol_agents().await;
+        assert!(
+            send_inputs(&f.fake).is_empty(),
+            "a blown fuse keeps the patrol off the conversation"
+        );
+        assert!(
+            f.service.locked_agents().get(&first.conversation).is_none(),
+            "the patrol stops watching a crash-looping conversation"
+        );
+        f.cleanup();
+    }
+
+    #[tokio::test]
+    async fn a_blown_fuse_still_lets_a_client_request_restart_the_agent() {
+        let f = Fixture::new(
+            Config::builtin(),
+            FakeHerdr::new().with_turns([
+                ScriptedTurn::Reply("one".to_string()),
+                ScriptedTurn::Exit,
+                ScriptedTurn::Reply("two".to_string()),
+            ]),
+        );
+        let first = f
+            .service
+            .chat(req("claude+agent-tools", Some("k1"), vec![user("hello")]))
+            .await
+            .expect("first chat");
+        let err = f
+            .service
+            .chat(req(
+                "claude+agent-tools",
+                Some("k1"),
+                vec![user("hello"), assistant("one"), user("second")],
+            ))
+            .await
+            .expect_err("the agent exits mid-turn");
+        assert_eq!((err.status, err.code), (502, "backing_agent_exited"));
+        {
+            let mut registry = f.service.locked_registry();
+            for _ in 0..conversation::RESTART_FUSE_LIMIT {
+                registry.note_patrol_restart(first.conversation);
+            }
+        }
+        f.service.patrol_agents().await;
+        f.service.patrol_agents().await;
+
+        // The fuse only stops the patrol: a request still gets an agent.
+        let retry = f
+            .service
+            .chat(req(
+                "claude+agent-tools",
+                Some("k1"),
+                vec![user("hello"), assistant("one"), user("second")],
+            ))
+            .await
+            .expect("client retry");
+        assert_eq!(retry.reply.text.as_deref(), Some("two"));
+        assert_eq!(start_count(&f.fake), 2, "the retry opens a new tab");
+        let prompts = prompt_calls(&f.fake);
+        assert!(
+            prompts
+                .last()
+                .expect("prompt")
+                .contains("Conversation so far:"),
+            "the retry replays the whole history"
+        );
+        f.cleanup();
+    }
+
+    #[tokio::test]
+    async fn a_request_during_a_patrol_restart_is_refused() {
+        let f = Fixture::new(
+            Config::builtin(),
+            FakeHerdr::new()
+                .with_turns([ScriptedTurn::Reply("one".to_string()), ScriptedTurn::Exit]),
+        );
+        let first = f
+            .service
+            .chat(req("claude+agent-tools", Some("k1"), vec![user("hello")]))
+            .await
+            .expect("first chat");
+        let err = f
+            .service
+            .chat(req(
+                "claude+agent-tools",
+                Some("k1"),
+                vec![user("hello"), assistant("one"), user("second")],
+            ))
+            .await
+            .expect_err("the agent exits mid-turn");
+        assert_eq!((err.status, err.code), (502, "backing_agent_exited"));
+
+        // The patrol owns this conversation while it replaces the CLI.
+        f.service.locked_patrol_busy().insert(first.conversation);
+        let err = f
+            .service
+            .chat(req(
+                "claude+agent-tools",
+                Some("k1"),
+                vec![user("hello"), assistant("one"), user("second")],
+            ))
+            .await
+            .expect_err("the patrol is mid-restart");
+        assert_eq!((err.status, err.code), (409, "conversation_busy"));
+        assert!(
+            send_inputs(&f.fake).is_empty(),
+            "the request never types into the pane the patrol is using"
+        );
+        f.cleanup();
+    }
+
+    #[tokio::test]
+    async fn patrol_restart_expires_the_dead_agent_s_pending_dialog() {
+        let f = Fixture::new(
+            Config::builtin(),
+            FakeHerdr::new()
+                .with_turns([ScriptedTurn::Reply("one".to_string()), ScriptedTurn::Exit]),
+        );
+        let first = f
+            .service
+            .chat(req("claude+agent-tools", Some("k1"), vec![user("hello")]))
+            .await
+            .expect("first chat");
+        let err = f
+            .service
+            .chat(req(
+                "claude+agent-tools",
+                Some("k1"),
+                vec![user("hello"), assistant("one"), user("second")],
+            ))
+            .await
+            .expect_err("the agent exits mid-turn");
+        assert_eq!((err.status, err.code), (502, "backing_agent_exited"));
+        // A dialog the dead agent relayed is still waiting for an answer.
+        {
+            let mut registry = f.service.locked_registry();
+            registry.set_dialog(
+                first.conversation,
+                PendingDialog {
+                    dialog: Dialog {
+                        question: "Accessing workspace:".to_string(),
+                        options: vec![
+                            "No, exit".to_string(),
+                            "Yes, I trust this folder".to_string(),
+                        ],
+                        cursor: 0,
+                    },
+                    reply: explanatory("the backing agent is waiting".to_string()),
+                    call_id: None,
+                    seq: 1,
+                    relayed_users: Vec::new(),
+                    relayed_count: 0,
+                    expired: false,
+                    hook: None,
+                },
+            );
+        }
+        f.service.patrol_agents().await;
+        f.service.patrol_agents().await;
+        let registry = f.service.locked_registry();
+        let record = registry.get(first.conversation).expect("record");
+        assert!(
+            record
+                .pending_dialog
+                .as_ref()
+                .expect("the dialog entry survives")
+                .expired,
+            "a late answer never types keys into the replacement CLI"
+        );
         f.cleanup();
     }
 
