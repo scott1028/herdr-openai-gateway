@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use herdr_openai_gateway::config::Config;
-use herdr_openai_gateway::herdr::fake::{FakeHerdr, ScriptedTurn};
+use herdr_openai_gateway::herdr::fake::{FakeHerdr, ScriptedTurn, StartupBehavior};
 use herdr_openai_gateway::server;
 use herdr_openai_gateway::service::{QuestionHookEnv, Service, ServiceEnv};
 
@@ -471,6 +471,147 @@ async fn two_keys_spawn_two_agents() {
 }
 
 #[tokio::test]
+async fn model_switch_on_same_key_replaces_the_backing_agent() {
+    let app = TestApp::new(
+        test_config(),
+        FakeHerdr::new().with_turns([
+            ScriptedTurn::Reply("one".to_string()),
+            ScriptedTurn::Reply("two".to_string()),
+        ]),
+    );
+    let mut first = app
+        .chat(
+            json!({"model": "claude+agent-tools", "messages": [{"role": "user", "content": "hello"}]}),
+            &[("x-herdr-conversation", "k1")],
+        )
+        .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let _ = json_body(&mut first).await;
+    let conversation = first.headers()["x-herdr-conversation"]
+        .to_str()
+        .expect("ascii")
+        .to_string();
+    let first_agent = first.headers()["x-herdr-agent"]
+        .to_str()
+        .expect("ascii")
+        .to_string();
+
+    let mut second = app
+        .chat(
+            json!({"model": "codex+agent-tools", "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "one"},
+                {"role": "user", "content": "next question"}
+            ]}),
+            &[("x-herdr-conversation", "k1")],
+        )
+        .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let body = json_body(&mut second).await;
+    assert_eq!(body["choices"][0]["message"]["content"], "two");
+    assert_eq!(
+        second.headers()["x-herdr-conversation"],
+        conversation,
+        "the conversation keeps its id across a model switch"
+    );
+    let second_agent = second.headers()["x-herdr-agent"]
+        .to_str()
+        .expect("ascii")
+        .to_string();
+    assert_ne!(second_agent, first_agent, "the backing CLI was replaced");
+    assert!(
+        second_agent.starts_with("oa-codex-"),
+        "agent header: {second_agent}"
+    );
+
+    let last_prompt = prompt_texts(&app.fake)
+        .pop()
+        .expect("a prompt for the new model");
+    assert!(
+        last_prompt.starts_with("Conversation so far:")
+            && last_prompt.contains("hello")
+            && last_prompt.contains("next question"),
+        "the fresh agent replays the history: {last_prompt}"
+    );
+    // Decided behaviour (A案): herdr has no `agent.stop`, so a live CLI cannot be
+    // replaced inside its pane. A model switch closes the old tab and opens a new
+    // one; only the threadId mapping is guaranteed to stay put.
+    let closed = app
+        .fake
+        .calls()
+        .iter()
+        .filter(|c| c.method == "tab.close")
+        .count();
+    assert_eq!(closed, 1, "the previous model's tab is closed");
+    assert_eq!(
+        start_count(&app.fake),
+        2,
+        "one launch per model, never a third"
+    );
+    app.cleanup();
+}
+
+#[tokio::test]
+async fn failed_model_switch_rebuilds_the_agent_on_the_next_request() {
+    let app = TestApp::new(
+        test_config(),
+        FakeHerdr::new().with_turns([
+            ScriptedTurn::Reply("one".to_string()),
+            ScriptedTurn::Reply("two".to_string()),
+        ]),
+    );
+    let mut first = app
+        .chat(
+            json!({"model": "claude+agent-tools", "messages": [{"role": "user", "content": "hello"}]}),
+            &[("x-herdr-conversation", "k1")],
+        )
+        .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let _ = json_body(&mut first).await;
+    let conversation = first.headers()["x-herdr-conversation"]
+        .to_str()
+        .expect("ascii")
+        .to_string();
+    let history = json!({"model": "codex+agent-tools", "messages": [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "one"},
+        {"role": "user", "content": "next question"}
+    ]});
+
+    // The new model cannot start an agent right now: the switch fails, and the
+    // conversation must keep its record instead of being dropped.
+    app.fake.set_startup(StartupBehavior::Fails);
+    let mut failed = app
+        .chat(history.clone(), &[("x-herdr-conversation", "k1")])
+        .await;
+    assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
+    let _ = json_body(&mut failed).await;
+
+    // Retrying the same key must not be stuck: the record has no agent, so the
+    // gateway rebuilds one and sends it the whole conversation.
+    app.fake.set_startup(StartupBehavior::Ready);
+    let mut retry = app.chat(history, &[("x-herdr-conversation", "k1")]).await;
+    assert_eq!(retry.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(&mut retry).await["choices"][0]["message"]["content"],
+        "two"
+    );
+    assert_eq!(
+        retry.headers()["x-herdr-conversation"],
+        conversation,
+        "the threadId mapping survived the failed switch"
+    );
+    let last_prompt = prompt_texts(&app.fake)
+        .pop()
+        .expect("a prompt for the rebuilt agent");
+    assert!(
+        last_prompt.starts_with("Conversation so far:") && last_prompt.contains("next question"),
+        "the rebuilt agent gets the whole history: {last_prompt}"
+    );
+    app.cleanup();
+}
+
+#[tokio::test]
 async fn identical_repeat_is_served_from_the_retry_cache() {
     let app = TestApp::new(
         test_config(),
@@ -804,7 +945,176 @@ async fn agent_exit_then_new_message_respawns_the_agent() {
         json_body(&mut after).await["choices"][0]["message"]["content"],
         "two"
     );
-    assert_eq!(start_count(&app.fake), 2, "agent was respawned");
+    assert_eq!(
+        start_count(&app.fake),
+        1,
+        "the CLI restarts inside the same tab"
+    );
+    assert_eq!(
+        after.headers()["x-herdr-tab"],
+        first.headers()["x-herdr-tab"],
+        "the conversation keeps its tab across the restart"
+    );
+    let restart = app
+        .fake
+        .calls()
+        .into_iter()
+        .rfind(|c| c.method == "pane.send_input")
+        .expect("the restart is typed into the pane")
+        .param("text")
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        restart.contains("--resume"),
+        "the restart resumes the session: {restart}"
+    );
+    app.cleanup();
+}
+
+#[tokio::test]
+async fn restart_failure_in_a_live_pane_falls_back_to_a_new_tab() {
+    let app = TestApp::new(
+        test_config(),
+        FakeHerdr::new().with_turns([
+            ScriptedTurn::Reply("one".to_string()),
+            ScriptedTurn::Exit,
+            ScriptedTurn::Reply("two".to_string()),
+        ]),
+    );
+    let mut first = app
+        .chat(
+            json!({"model": "claude+agent-tools", "messages": [{"role": "user", "content": "hello"}]}),
+            &[("x-herdr-conversation", "k1")],
+        )
+        .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let _ = json_body(&mut first).await;
+    let mut during = app
+        .chat(
+            json!({"model": "claude+agent-tools", "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "one"},
+                {"role": "user", "content": "during exit"}
+            ]}),
+            &[("x-herdr-conversation", "k1")],
+        )
+        .await;
+    assert_eq!(during.status(), StatusCode::BAD_GATEWAY);
+    let _ = json_body(&mut during).await;
+
+    // The pane is still open but its shell rejects the typed command, so the
+    // in-place restart fails and the conversation moves to a new tab.
+    app.fake.set_send_input_fails(true);
+    let mut after = app
+        .chat(
+            json!({"model": "claude+agent-tools", "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "one"},
+                {"role": "user", "content": "after the failed restart"}
+            ]}),
+            &[("x-herdr-conversation", "k1")],
+        )
+        .await;
+    assert_eq!(after.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(&mut after).await["choices"][0]["message"]["content"],
+        "two"
+    );
+    assert_eq!(start_count(&app.fake), 2, "the fallback opens one new tab");
+    assert_ne!(
+        after.headers()["x-herdr-tab"],
+        first.headers()["x-herdr-tab"],
+        "the fallback could not reuse the pane, so the tab changed"
+    );
+    let last_prompt = prompt_texts(&app.fake)
+        .pop()
+        .expect("a prompt for the new agent");
+    assert!(
+        last_prompt.starts_with("Conversation so far:")
+            && last_prompt.contains("after the failed restart"),
+        "the fallback replays the history: {last_prompt}"
+    );
+    app.cleanup();
+}
+
+#[tokio::test]
+async fn exited_agent_without_a_session_id_restarts_with_the_history() {
+    // A codex agent whose session id herdr never reported cannot complete a turn
+    // (`completion_not_observed`), so both requests here fail. What is under test
+    // is what the gateway typed into the pane and what it then prompted: a CLI
+    // with no session to resume gets the whole history in its first prompt.
+    let app = TestApp::new(
+        test_config(),
+        FakeHerdr::new()
+            .with_turns([ScriptedTurn::Exit, ScriptedTurn::Reply("two".to_string())])
+            .with_agent_session_hidden(),
+    );
+    let mut first = app
+        .chat(
+            json!({"model": "codex+agent-tools", "messages": [{"role": "user", "content": "hello"}]}),
+            &[("x-herdr-conversation", "k1")],
+        )
+        .await;
+    assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+    let _ = json_body(&mut first).await;
+
+    let mut after = app
+        .chat(
+            json!({"model": "codex+agent-tools", "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "one"},
+                {"role": "user", "content": "after exit"}
+            ]}),
+            &[("x-herdr-conversation", "k1")],
+        )
+        .await;
+    assert_eq!(after.status(), StatusCode::BAD_GATEWAY);
+    let _ = json_body(&mut after).await;
+    let restart = app
+        .fake
+        .calls()
+        .into_iter()
+        .rfind(|c| c.method == "pane.send_input")
+        .expect("the restart is typed into the pane")
+        .param("text")
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !restart.contains("resume"),
+        "no session id means no resume flag: {restart}"
+    );
+    let last_prompt = prompt_texts(&app.fake)
+        .pop()
+        .expect("a prompt for the restarted agent");
+    assert!(
+        last_prompt.starts_with("Conversation so far:") && last_prompt.contains("after exit"),
+        "the fresh CLI gets the whole history: {last_prompt}"
+    );
+
+    // The turn still fails, so the consumed point must stay at zero: the next
+    // request replays the whole conversation to this same fresh CLI as well.
+    let mut third = app
+        .chat(
+            json!({"model": "codex+agent-tools", "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "one"},
+                {"role": "user", "content": "after exit"},
+                {"role": "user", "content": "and again"}
+            ]}),
+            &[("x-herdr-conversation", "k1")],
+        )
+        .await;
+    assert_eq!(third.status(), StatusCode::BAD_GATEWAY);
+    let _ = json_body(&mut third).await;
+    let third_prompt = prompt_texts(&app.fake)
+        .pop()
+        .expect("a prompt for the third request");
+    assert!(
+        third_prompt.starts_with("Conversation so far:")
+            && third_prompt.contains("and again")
+            && third_prompt.contains("hello"),
+        "the fresh CLI is still replayed the whole history: {third_prompt}"
+    );
     app.cleanup();
 }
 

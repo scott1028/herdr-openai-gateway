@@ -196,6 +196,9 @@ struct StartPlan {
     id: ConversationId,
     prompt_text: String,
     job: TurnJob,
+    /// True when the record was created by this reservation: a failed launch
+    /// drops it. A model switch keeps the record so the conversation id survives.
+    new_record: bool,
     tx: watch::Sender<TurnState>,
     /// The requester's join handle, created in the same critical section as the
     /// in-flight marker so `receiver_count` is never 0 before the requester
@@ -778,7 +781,133 @@ impl<H: HerdrApi> Service<H> {
             Classification::Continue { id, delta } => {
                 self.reserve_continue(&mut registry, req, &digest, id, delta, superseded)
             }
+            Classification::ModelSwitch(id) => {
+                self.reserve_model_switch(&mut registry, req, &digest, id, superseded)
+            }
         }
+    }
+
+    /// Reserve a `ModelSwitch` turn: the record, its conversation id, and its
+    /// history stay put; only the backing CLI is replaced. The fresh agent has no
+    /// context of its own, so the first prompt replays the whole history. herdr
+    /// cannot stop a running agent, so the old tab is closed and a new one opens;
+    /// the threadId mapping itself does not change.
+    fn reserve_model_switch(
+        &self,
+        registry: &mut Registry,
+        req: &NormalizedRequest,
+        digest: &str,
+        id: ConversationId,
+        superseded: Option<Arc<TurnLock>>,
+    ) -> Reserved {
+        // The record moves to another model, so the target model's own limit is
+        // checked before anything is touched: a refused switch leaves the
+        // conversation running the model it is already on.
+        let mut close = Vec::new();
+        if registry.count_for_model(&req.model) >= self.config.conversations.max_agents_per_model {
+            // Only a conversation of the target model frees a slot in it.
+            let victim = registry
+                .evict_candidate(Instant::now())
+                .filter(|victim| *victim != id)
+                .filter(|victim| {
+                    registry
+                        .get(*victim)
+                        .is_some_and(|record| record.model_id == req.model)
+                });
+            match victim {
+                Some(victim) => {
+                    registry.remove(victim);
+                    self.locked_clients().remove(&victim);
+                    if let Some(handle) = self.locked_agents().remove(&victim) {
+                        tracing::info!(
+                            name = %handle.name,
+                            "evicting backing agent for the model switch"
+                        );
+                        close.push(handle);
+                    }
+                }
+                None => {
+                    return Reserved::Finished(Err(ApiError::too_many_backing_agents(format!(
+                        "model `{}` already runs {} backing agents; none of them are idle long \
+                         enough to reclaim for the switch",
+                        req.model, self.config.conversations.max_agents_per_model
+                    ))));
+                }
+            }
+        }
+        if let Some(handle) = self.locked_agents().remove(&id) {
+            tracing::info!(
+                name = %handle.name,
+                model = %req.model,
+                "switching the backing agent to another model"
+            );
+            close.push(handle);
+        }
+        registry.set_model(id, &req.model);
+        self.reserve_spawn_turn(registry, req, digest, id, superseded, close)
+    }
+
+    /// Reserve a turn for a record whose backing agent is gone. A failed switch or
+    /// respawn keeps the threadId mapping, so rebuild the agent and send it the
+    /// whole conversation instead of failing every later request.
+    fn reserve_rebuild(
+        &self,
+        registry: &mut Registry,
+        req: &NormalizedRequest,
+        digest: &str,
+        id: ConversationId,
+        superseded: Option<Arc<TurnLock>>,
+    ) -> Reserved {
+        self.reserve_spawn_turn(registry, req, digest, id, superseded, Vec::new())
+    }
+
+    /// Shared tail of both rebuild paths: a fresh agent, the whole history as its
+    /// first prompt, and the record kept whatever else happens.
+    fn reserve_spawn_turn(
+        &self,
+        registry: &mut Registry,
+        req: &NormalizedRequest,
+        digest: &str,
+        id: ConversationId,
+        superseded: Option<Arc<TurnLock>>,
+        close: Vec<AgentHandle>,
+    ) -> Reserved {
+        self.locked_bridge().remove(&id);
+        // This CLI has seen nothing, so a later request must replay as well in
+        // case this turn never gets through.
+        registry.reset_consumed(id);
+        let bootstrap = conversation::bootstrap_flag(req);
+        let prompt_text = if self.model_mode(&req.model) == ModelMode::Bridge {
+            bridge::bridge_first_prompt(req, bootstrap)
+        } else {
+            prompt::self_exec_first_prompt(req, bootstrap)
+        };
+        let generation = registry.begin(id, digest.to_string(), req);
+        let (tx, rx) = watch::channel(TurnState::Running);
+        // A turn this request replaces keeps its lock so its task finishes before
+        // this one prompts the agent.
+        let turn_lock = superseded.unwrap_or_else(|| Arc::new(TurnLock::new(())));
+        self.locked_inflight().insert(
+            id,
+            InflightTurn {
+                tx: tx.clone(),
+                turn_lock: Arc::clone(&turn_lock),
+                question_offered: dialog::question_tool_offered(&req.tools),
+                hook_pause: Arc::new(HookPause::default()),
+            },
+        );
+        Reserved::Start(StartPlan {
+            id,
+            prompt_text,
+            job: TurnJob::SpawnNew,
+            new_record: false,
+            tx,
+            rx: Some(rx),
+            turn_lock,
+            generation,
+            interrupt: false,
+            close,
+        })
     }
 
     /// Reserve a `Continue` turn. `superseded` carries the abandoned turn's lock
@@ -794,9 +923,9 @@ impl<H: HerdrApi> Service<H> {
         superseded: Option<Arc<TurnLock>>,
     ) -> Reserved {
         let Some(agent) = self.locked_agents().get(&id).cloned() else {
-            return Reserved::Finished(Err(ApiError::backing_agent_exited(
-                "the conversation lost its backing agent; send the message again",
-            )));
+            // The record outlived its agent (a switch or respawn that failed to
+            // launch): rebuild it and replay, instead of failing every retry.
+            return self.reserve_rebuild(registry, req, digest, id, superseded);
         };
         // No turn has ever completed on this record (startup blocked or a
         // failed first turn): replay the full first prompt, not a delta.
@@ -837,6 +966,7 @@ impl<H: HerdrApi> Service<H> {
             job: TurnJob::RunExisting {
                 agent: Box::new(agent),
             },
+            new_record: false,
             tx,
             rx: Some(rx),
             turn_lock,
@@ -1100,6 +1230,7 @@ impl<H: HerdrApi> Service<H> {
             id,
             prompt_text,
             job: TurnJob::SpawnNew,
+            new_record: true,
             tx,
             rx: Some(rx),
             turn_lock,
@@ -1247,6 +1378,88 @@ impl<H: HerdrApi> Service<H> {
         ))
     }
 
+    /// Per-launch additions on top of the model spec: Claude's agent-view env and
+    /// the question-hook settings. The hook token lives in the tab env, so a CLI
+    /// restarted inside the same tab keeps it without re-injecting env.
+    fn launch_extras(&self, model: &ModelSpec) -> LaunchExtras {
+        let mut extras = LaunchExtras::default();
+        if model.kind != AgentKind::Claude {
+            return extras;
+        }
+        if !model.env.contains_key(CLAUDE_DISABLE_AGENT_VIEW_ENV) {
+            extras
+                .env
+                .insert(CLAUDE_DISABLE_AGENT_VIEW_ENV.to_string(), "1".to_string());
+        }
+        let Some(hook) = self.env.question_hook.as_ref() else {
+            return extras;
+        };
+        extras.args = vec![
+            "--settings".to_string(),
+            question_hook::claude_settings_arg(
+                &hook.url,
+                self.config.herdr.blocked_timeout_ms / 1000 + 30,
+            ),
+        ];
+        extras.env.insert(
+            "HERDR_OPENAI_GATEWAY_HOOK_TOKEN".to_string(),
+            hook.token.clone(),
+        );
+        extras
+    }
+
+    /// Restart the record's model inside the agent's own pane, resuming the CLI's
+    /// session when the gateway still knows its id.
+    async fn restart_agent_in_place_for(
+        &self,
+        id: ConversationId,
+        agent: &mut AgentHandle,
+        resume_session: Option<&str>,
+    ) -> Result<(), LaunchError> {
+        let Some(model_id) = self
+            .locked_registry()
+            .get(id)
+            .map(|record| record.model_id.clone())
+        else {
+            return Err(LaunchError::Failed(ApiError::backing_agent_exited(
+                "the backing agent exited and cannot be respawned",
+            )));
+        };
+        let Some(model) = self.config.models.iter().find(|model| model.id == model_id) else {
+            return Err(LaunchError::Failed(ApiError::backing_agent_exited(
+                "the backing agent exited and cannot be respawned",
+            )));
+        };
+        match lifecycle::restart_agent_in_place(
+            &*self.herdr,
+            agent,
+            model,
+            self.config.herdr.startup_timeout_ms,
+            &self.launch_extras(model),
+            resume_session,
+            &self.owner_id,
+        )
+        .await
+        {
+            Ok(()) => Ok(()),
+            // The restarted CLI waits on a dialog in the same tab: register the
+            // half-ready handle so the next request awaits this same pane
+            // instead of prompting a name herdr no longer knows.
+            Err(lifecycle::SpawnError::StartupBlocked { .. }) => {
+                if self.register_agent_or_close(id, agent).await {
+                    Err(LaunchError::Blocked {
+                        handle: agent.clone(),
+                    })
+                } else {
+                    Err(LaunchError::Failed(ApiError::backing_agent_exited(
+                        "the backing agent exited and cannot be respawned",
+                    )))
+                }
+            }
+            Err(err) => Err(LaunchError::Failed(err.into_api_error())),
+        }
+    }
+
     /// Launch and await the backing agent for a reserved record. On `Blocked` the
     /// handle is stored with `ready = false` so a later request awaits the same
     /// tab instead of spawning another agent.
@@ -1270,27 +1483,7 @@ impl<H: HerdrApi> Service<H> {
             Ok(workspace_id) => workspace_id,
             Err(err) => return Err(LaunchError::Failed(err)),
         };
-        let mut extras = LaunchExtras::default();
-        if model.kind == AgentKind::Claude {
-            if !model.env.contains_key(CLAUDE_DISABLE_AGENT_VIEW_ENV) {
-                extras
-                    .env
-                    .insert(CLAUDE_DISABLE_AGENT_VIEW_ENV.to_string(), "1".to_string());
-            }
-            if let Some(hook) = self.env.question_hook.as_ref() {
-                extras.args = vec![
-                    "--settings".to_string(),
-                    question_hook::claude_settings_arg(
-                        &hook.url,
-                        self.config.herdr.blocked_timeout_ms / 1000 + 30,
-                    ),
-                ];
-                extras.env.insert(
-                    "HERDR_OPENAI_GATEWAY_HOOK_TOKEN".to_string(),
-                    hook.token.clone(),
-                );
-            }
-        }
+        let extras = self.launch_extras(model);
         let mut handle = match lifecycle::launch_agent(
             &*self.herdr,
             &workspace_id,
@@ -1601,11 +1794,10 @@ impl<H: HerdrApi> Service<H> {
                                 if let Err(err) =
                                     lifecycle::rename_unmanaged(&*self.herdr, &mut handle).await
                                 {
+                                    // The pane hosts an agent this turn cannot
+                                    // name. Drop the handle and keep the record:
+                                    // the next request rebuilds on this threadId.
                                     self.locked_agents().remove(&id);
-                                    if !self.is_superseded(id, generation) {
-                                        self.locked_registry().remove(id);
-                                        self.locked_clients().remove(&id);
-                                    }
                                     return Err(err.into_api_error());
                                 }
                             }
@@ -1624,9 +1816,7 @@ impl<H: HerdrApi> Service<H> {
                             // The pane reports no agent: count it as missing.
                             let since = *missing_since.get_or_insert_with(Instant::now);
                             if since.elapsed() >= AGENT_EXIT_CONFIRM {
-                                return Err(self
-                                    .agent_exited_after_dialog(id, generation, &handle)
-                                    .await);
+                                return Err(self.agent_exited_after_dialog(id, &handle).await);
                             }
                         }
                     }
@@ -1636,9 +1826,7 @@ impl<H: HerdrApi> Service<H> {
                     let since = *missing_since.get_or_insert_with(Instant::now);
                     if since.elapsed() >= AGENT_EXIT_CONFIRM {
                         // The answer closed the agent (e.g. "No, exit").
-                        return Err(self
-                            .agent_exited_after_dialog(id, generation, &handle)
-                            .await);
+                        return Err(self.agent_exited_after_dialog(id, &handle).await);
                     }
                 }
                 Err(err) => {
@@ -1656,20 +1844,15 @@ impl<H: HerdrApi> Service<H> {
         }
     }
 
-    /// The answer exited the backing agent: close the tab, drop the handle and
-    /// the record, and name the failure for the client.
+    /// The answer exited the backing agent: close the tab and drop the handle. The
+    /// record stays, so the next request rebuilds the agent on the same threadId.
     async fn agent_exited_after_dialog(
         &self,
         id: ConversationId,
-        generation: u64,
         handle: &AgentHandle,
     ) -> ApiError {
         lifecycle::close_agent(&*self.herdr, handle, &self.owner_id).await;
         self.locked_agents().remove(&id);
-        if !self.is_superseded(id, generation) {
-            self.locked_registry().remove(id);
-            self.locked_clients().remove(&id);
-        }
         ApiError::backing_agent_exited("the backing agent exited after the dialog was answered")
     }
 
@@ -2026,7 +2209,10 @@ impl<H: HerdrApi> Service<H> {
                         .await?
                 }
                 Err(LaunchError::Failed(err)) => {
-                    if !self.is_superseded(id, generation) {
+                    // Only a record this request created is dropped; a model
+                    // switch keeps its id and history so the next request can
+                    // retry on the same conversation.
+                    if plan.new_record && !self.is_superseded(id, generation) {
                         self.locked_registry().remove(id);
                         self.locked_clients().remove(&id);
                     }
@@ -2054,8 +2240,8 @@ impl<H: HerdrApi> Service<H> {
         // One turn at a time may touch this conversation's agent: a superseding
         // turn waits here for the turn it replaced to finish.
         let _turn_guard = plan.turn_lock.lock().await;
-        // An agent that exited since the last turn gets a fresh tab bootstrapped with
-        // the full history (no --resume in the MVP).
+        // An agent that exited since the last turn is replaced inside its own
+        // pane, resuming its session when the gateway knows the id.
         let gone = match self.herdr.agent_get(&agent.name).await {
             Ok(_) => false,
             Err(HerdrError::Api { code, .. }) if code == "agent_not_found" => {
@@ -2065,24 +2251,63 @@ impl<H: HerdrApi> Service<H> {
             Err(_) => false,
         };
         if gone {
-            tracing::warn!(name = %agent.name, "backing agent is gone; respawning");
-            lifecycle::close_agent(&*self.herdr, &agent, &self.owner_id).await;
-            agent = match self.spawn_agent_for(id).await {
-                Ok(handle) => handle,
-                Err(LaunchError::Blocked { handle }) => {
-                    self.resolve_startup_blocked(id, generation, handle, &plan.tx, &req, true)
-                        .await?
+            // The pane is still there, so put a new CLI in it instead of opening
+            // another tab; resume restores the CLI's own context when its session
+            // id is known.
+            let resume = agent.session_id.clone();
+            let replay = |req: &NormalizedRequest| {
+                self.locked_bridge().remove(&id);
+                // A CLI with nothing resumed has seen none of this conversation,
+                // so a later request must replay too if this turn fails.
+                self.locked_registry().reset_consumed(id);
+                if self.model_mode(&req.model) == ModelMode::Bridge {
+                    bridge::bridge_first_prompt(req, true)
+                } else {
+                    prompt::self_exec_first_prompt(req, true)
                 }
-                // Respawn failure keeps the record; the task wrapper clears the
-                // in-flight marker so a following request is not stuck Busy.
-                Err(LaunchError::Failed(err)) => return Err(err),
             };
-            self.locked_bridge().remove(&id);
-            prompt_text = if self.model_mode(&req.model) == ModelMode::Bridge {
-                bridge::bridge_first_prompt(&req, true)
-            } else {
-                prompt::self_exec_first_prompt(&req, true)
-            };
+            match self
+                .restart_agent_in_place_for(id, &mut agent, resume.as_deref())
+                .await
+            {
+                Ok(()) => {
+                    if resume.is_none() {
+                        prompt_text = replay(&req);
+                    }
+                }
+                Err(LaunchError::Blocked { handle }) => {
+                    agent = self
+                        .resolve_startup_blocked(id, generation, handle, &plan.tx, &req, true)
+                        .await?;
+                    // Same rule as the Ok arm: a restarted CLI that was resumed
+                    // already holds the conversation, one that was not needs the
+                    // whole history in its first prompt.
+                    if resume.is_none() {
+                        prompt_text = replay(&req);
+                    }
+                }
+                Err(LaunchError::Failed(err)) => {
+                    tracing::warn!(
+                        name = %agent.name,
+                        error = %err.message,
+                        "cannot restart the agent in its pane; opening a new one"
+                    );
+                    lifecycle::close_agent(&*self.herdr, &agent, &self.owner_id).await;
+                    agent = match self.spawn_agent_for(id).await {
+                        Ok(handle) => handle,
+                        Err(LaunchError::Blocked { handle }) => {
+                            self.resolve_startup_blocked(
+                                id, generation, handle, &plan.tx, &req, true,
+                            )
+                            .await?
+                        }
+                        // Respawn failure keeps the record; the task wrapper clears the
+                        // in-flight marker so a following request is not stuck Busy.
+                        Err(LaunchError::Failed(err)) => return Err(err),
+                    };
+                    prompt_text = replay(&req);
+                }
+            }
         }
         let roots = self
             .transcript_roots
@@ -2100,7 +2325,11 @@ impl<H: HerdrApi> Service<H> {
         )
         .await;
         // Keep transcript/session follow-ups (continued-in) for the next turn.
-        self.register_agent_or_close(id, &agent).await;
+        // An abandoned turn must not put its handle back: the turn that replaced
+        // it owns this conversation's agent now.
+        if !self.is_superseded(id, generation) {
+            self.register_agent_or_close(id, &agent).await;
+        }
         let bridge = self.model_mode(&req.model) == ModelMode::Bridge;
         let reply = match outcome {
             Ok(TurnOutcome::Completed { text, stop }) if bridge => {
@@ -2857,6 +3086,20 @@ mod tests {
             .count()
     }
 
+    /// Commands typed into a pane's shell, as `(text, pane_id)`.
+    fn send_inputs(fake: &FakeHerdr) -> Vec<(String, String)> {
+        fake.calls()
+            .iter()
+            .filter(|c| c.method == "pane.send_input")
+            .map(|c| {
+                (
+                    c.param("text").unwrap_or_default().to_string(),
+                    c.param("pane_id").unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
     async fn wait_for_prompt(fake: &FakeHerdr) {
         // A post-dialog wait adds a `POST_DIALOG_SETTLE` pause before the
         // first prompt, so the budget must stay above it.
@@ -3535,7 +3778,8 @@ mod tests {
                 ScriptedTurn::Reply("two".to_string()),
             ]),
         );
-        f.service
+        let first = f
+            .service
             .chat(req("claude+agent-tools", Some("k1"), vec![user("hello")]))
             .await
             .expect("first chat");
@@ -3550,7 +3794,16 @@ mod tests {
             .expect_err("exited mid-turn");
         assert_eq!((err.status, err.code), (502, "backing_agent_exited"));
         // The respawn cannot start a new agent; the error must not leave the
-        // conversation stuck as Busy.
+        // conversation stuck as Busy. The tab is closed, so there is no pane to
+        // restart into and the respawn goes straight to a new launch.
+        let tab_id = f
+            .service
+            .locked_agents()
+            .get(&first.conversation)
+            .expect("agent")
+            .tab_id
+            .clone();
+        f.fake.tab_close(&tab_id).await.expect("close tab");
         f.fake.set_startup(StartupBehavior::Fails);
         let follow = req(
             "claude+agent-tools",
@@ -4364,7 +4617,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exited_agent_respawns_with_bootstrap_on_the_next_request() {
+    async fn exited_agent_resumes_in_its_own_pane_and_sends_only_the_delta() {
         let f = Fixture::new(
             Config::builtin(),
             FakeHerdr::new().with_turns([
@@ -4373,10 +4626,17 @@ mod tests {
                 ScriptedTurn::Reply("two".to_string()),
             ]),
         );
-        f.service
+        let first = f
+            .service
             .chat(req("claude+agent-tools", Some("k1"), vec![user("hello")]))
             .await
             .expect("first chat");
+        let (pane_id, session_id) = {
+            let agents = f.service.locked_agents();
+            let agent = agents.get(&first.conversation).expect("agent");
+            (agent.pane_id.clone(), agent.session_id.clone())
+        };
+        let session_id = session_id.expect("claude session id");
         // The agent exits during the second turn: the client sees 502.
         let err = f
             .service
@@ -4388,7 +4648,7 @@ mod tests {
             .await
             .expect_err("exited mid-turn");
         assert_eq!((err.status, err.code), (502, "backing_agent_exited"));
-        // The next request finds the agent gone and respawns with a bootstrap prompt.
+        // The next request finds the agent gone and restarts it in the same pane.
         let outcome = f
             .service
             .chat(req(
@@ -4399,13 +4659,140 @@ mod tests {
             .await
             .expect("third chat");
         assert_eq!(outcome.reply.text.as_deref(), Some("two"));
-        assert_eq!(start_count(&f.fake), 2, "agent respawned");
+        assert_eq!(start_count(&f.fake), 1, "no new tab for a restart");
+        assert_eq!(
+            f.fake
+                .calls()
+                .iter()
+                .filter(|c| c.method == "tab.close")
+                .count(),
+            0,
+            "the original tab is never closed"
+        );
+        let sends = send_inputs(&f.fake);
+        assert_eq!(
+            sends.len(),
+            1,
+            "the CLI is restarted by typing into the pane"
+        );
+        let (line, pane) = &sends[0];
+        assert_eq!(pane, &pane_id, "the same pane hosts the new CLI");
+        assert!(
+            line.contains("--resume") && line.contains(&session_id),
+            "the restart resumes the session: {line}"
+        );
+        assert_eq!(
+            prompt_calls(&f.fake).last().expect("prompt"),
+            "after exit",
+            "a resumed CLI keeps its own context, so only the delta is sent"
+        );
+        assert_eq!(
+            f.service
+                .locked_agents()
+                .get(&first.conversation)
+                .expect("agent")
+                .pane_id,
+            pane_id,
+            "the conversation still points at the same pane"
+        );
+        f.cleanup();
+    }
+
+    #[tokio::test]
+    async fn exited_codex_agent_resumes_with_its_rollout_session_id() {
+        let f = Fixture::new(
+            Config::builtin(),
+            FakeHerdr::new().with_turns([
+                ScriptedTurn::Reply("one".to_string()),
+                ScriptedTurn::Exit,
+                ScriptedTurn::Reply("two".to_string()),
+            ]),
+        );
+        let first = f
+            .service
+            .chat(req("codex+agent-tools", Some("k1"), vec![user("hello")]))
+            .await
+            .expect("first chat");
+        let session_id = f
+            .service
+            .locked_agents()
+            .get(&first.conversation)
+            .expect("agent")
+            .session_id
+            .clone()
+            .expect("codex session id from agent_session");
+        let err = f
+            .service
+            .chat(req(
+                "codex+agent-tools",
+                Some("k1"),
+                vec![user("hello"), assistant("one"), user("during exit")],
+            ))
+            .await
+            .expect_err("exited mid-turn");
+        assert_eq!((err.status, err.code), (502, "backing_agent_exited"));
+        let outcome = f
+            .service
+            .chat(req(
+                "codex+agent-tools",
+                Some("k1"),
+                vec![user("hello"), assistant("one"), user("after exit")],
+            ))
+            .await
+            .expect("third chat");
+        assert_eq!(outcome.reply.text.as_deref(), Some("two"));
+        assert_eq!(start_count(&f.fake), 1, "no new tab for a restart");
+        let line = send_inputs(&f.fake).pop().expect("restart line").0;
+        assert!(
+            line.starts_with("codex resume ") && line.contains(&session_id),
+            "codex resumes through its subcommand: {line}"
+        );
+        f.cleanup();
+    }
+
+    #[tokio::test]
+    async fn closed_pane_respawns_in_a_new_tab_with_bootstrap() {
+        let f = Fixture::new(
+            Config::builtin(),
+            FakeHerdr::new().with_turns([
+                ScriptedTurn::Reply("one".to_string()),
+                ScriptedTurn::Reply("two".to_string()),
+            ]),
+        );
+        let first = f
+            .service
+            .chat(req("claude+agent-tools", Some("k1"), vec![user("hello")]))
+            .await
+            .expect("first chat");
+        let tab_id = f
+            .service
+            .locked_agents()
+            .get(&first.conversation)
+            .expect("agent")
+            .tab_id
+            .clone();
+        // The tab is closed by hand: no pane left to restart into.
+        f.fake.tab_close(&tab_id).await.expect("close tab");
+        let outcome = f
+            .service
+            .chat(req(
+                "claude+agent-tools",
+                Some("k1"),
+                vec![user("hello"), assistant("one"), user("after close")],
+            ))
+            .await
+            .expect("second chat");
+        assert_eq!(outcome.reply.text.as_deref(), Some("two"));
+        assert_eq!(start_count(&f.fake), 2, "a new tab hosts the respawned CLI");
         let prompts = prompt_calls(&f.fake);
-        assert!(prompts
-            .last()
-            .expect("prompt")
-            .contains("Conversation so far:"));
-        assert!(prompts.last().expect("prompt").contains("after exit"));
+        assert!(
+            prompts
+                .last()
+                .expect("prompt")
+                .contains("Conversation so far:"),
+            "the new CLI gets the full history"
+        );
+        assert!(prompts.last().expect("prompt").contains("after close"));
         f.cleanup();
     }
 
@@ -5308,11 +5695,15 @@ mod tests {
         );
         assert!(oa_tabs(&f.fake).is_empty(), "the tab is closed");
         assert!(
+            f.service.locked_agents().get(&relay.conversation).is_none(),
+            "the exited agent is dropped"
+        );
+        assert!(
             f.service
                 .locked_registry()
                 .get(relay.conversation)
-                .is_none(),
-            "the record is removed"
+                .is_some(),
+            "the record survives: the threadId mapping does not change"
         );
         f.cleanup();
     }

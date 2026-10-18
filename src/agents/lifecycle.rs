@@ -513,6 +513,66 @@ async fn agent_gone<H: HerdrApi>(h: &H, agent: &AgentHandle) -> Result<(), Spawn
     Err(SpawnError::StartFailed)
 }
 
+/// Restart the CLI inside an existing pane: the tab, its cwd, and its owner
+/// token stay put; only the process is replaced. Use it once the old agent has
+/// exited and the pane is back at a shell, because herdr has no way to stop a
+/// running agent. `resume_session` adds the CLI's resume flags; pass `None` to
+/// start a fresh session in the same pane.
+pub async fn restart_agent_in_place<H: HerdrApi>(
+    h: &H,
+    agent: &mut AgentHandle,
+    model: &ModelSpec,
+    startup_timeout_ms: u64,
+    extras: &LaunchExtras,
+    resume_session: Option<&str>,
+    owner_id: &str,
+) -> Result<(), SpawnError> {
+    let mut args: Vec<String> = Vec::new();
+    let mut session_id = agent.session_id.clone();
+    if model.kind == AgentKind::Codex {
+        // `codex resume <id>` is a subcommand: it comes before the other args.
+        session_id = None;
+        if let Some(id) = resume_session {
+            args.extend(["resume".to_string(), id.to_string()]);
+        }
+    }
+    args.extend(model.args.iter().cloned());
+    args.extend(extras.args.iter().cloned());
+    if model.kind == AgentKind::Claude {
+        match resume_session {
+            Some(id) => args.extend(["--resume".to_string(), id.to_string()]),
+            None => {
+                let id = Uuid::new_v4().to_string();
+                args.extend(["--session-id".to_string(), id.clone()]);
+                session_id = Some(id);
+            }
+        }
+    }
+    let command = model.command.as_deref().unwrap_or(model.kind.herdr_label());
+    let mut line = command.to_string();
+    for arg in &args {
+        line.push(' ');
+        line.push_str(&quote_arg(arg));
+    }
+    if let Err(err) = h.pane_send_input(&agent.pane_id, &line, &["Enter"]).await {
+        return Err(SpawnError::Herdr(err));
+    }
+    // The pane survived, so its token only needs the TTL refreshed.
+    if let Err(err) = report_owner_token(h, &agent.pane_id, owner_id).await {
+        tracing::warn!(
+            pane_id = %agent.pane_id,
+            "owner token report failed after restart: {err}"
+        );
+    }
+    agent.kind = model.kind;
+    agent.model_id = model.id.clone();
+    agent.session_id = session_id;
+    agent.transcript = None;
+    agent.managed = false;
+    agent.ready = false;
+    await_ready_unmanaged(h, agent, startup_timeout_ms).await
+}
+
 /// Launch and await readiness in one step.
 pub async fn spawn_agent<H: HerdrApi>(
     h: &H,
@@ -699,7 +759,7 @@ pub async fn refresh_owner_tokens<H: HerdrApi>(h: &H, workspace_id: &str, owner_
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr::fake::{FakeHerdr, StartupBehavior};
+    use crate::herdr::fake::{FakeHerdr, ScriptedTurn, StartupBehavior};
     use std::collections::BTreeMap;
 
     const OWNER: &str = "owner-test";
@@ -1472,5 +1532,145 @@ mod tests {
         .expect_err("exited");
         assert!(matches!(err, SpawnError::StartFailed));
         assert_eq!(fake.tab_labels("w1"), vec!["lobby".to_string()]);
+    }
+
+    fn codex_model() -> ModelSpec {
+        ModelSpec {
+            id: "codex+agent-tools".to_string(),
+            kind: AgentKind::Codex,
+            command: None,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: None,
+        }
+    }
+
+    /// The CLI exits, so herdr drops the agent and the pane is back at a shell.
+    async fn exit_agent(fake: &FakeHerdr, handle: &AgentHandle) {
+        fake.agent_prompt(&handle.name, "bye", None)
+            .await
+            .expect_err("the scripted turn exits the agent");
+    }
+
+    fn last_send_input(fake: &FakeHerdr) -> (String, String) {
+        let call = fake
+            .calls()
+            .into_iter()
+            .rfind(|c| c.method == "pane.send_input")
+            .expect("pane.send_input");
+        (
+            call.param("text").unwrap_or_default().to_string(),
+            call.param("pane_id").unwrap_or_default().to_string(),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restart_in_place_resumes_claude_in_the_same_pane() {
+        let fake = FakeHerdr::new().with_turns([ScriptedTurn::Exit]);
+        let mut handle = spawn_in_fake(&fake).await.expect("spawn");
+        let pane_id = handle.pane_id.clone();
+        let tab_id = handle.tab_id.clone();
+        let session = handle.session_id.clone().expect("session id");
+        let tabs_before = fake.tab_labels("w1").len();
+        exit_agent(&fake, &handle).await;
+
+        restart_agent_in_place(
+            &fake,
+            &mut handle,
+            &model("claude+agent-tools"),
+            10_000,
+            &LaunchExtras::default(),
+            Some(&session),
+            OWNER,
+        )
+        .await
+        .expect("restart");
+
+        assert!(handle.ready);
+        assert_eq!(handle.pane_id, pane_id, "the same pane hosts the new CLI");
+        assert_eq!(handle.tab_id, tab_id, "no new tab is opened");
+        assert_eq!(fake.tab_labels("w1").len(), tabs_before);
+        assert_eq!(handle.session_id.as_deref(), Some(session.as_str()));
+        let (text, target) = last_send_input(&fake);
+        assert_eq!(target, pane_id);
+        assert!(text.starts_with("claude "), "got {text}");
+        assert!(
+            text.ends_with(&format!("--resume {session}")),
+            "claude resumes last: {text}"
+        );
+        assert!(
+            !text.contains("--session-id"),
+            "a resumed claude keeps its id: {text}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restart_in_place_starts_a_fresh_claude_session_when_no_id_is_known() {
+        let fake = FakeHerdr::new().with_turns([ScriptedTurn::Exit]);
+        let mut handle = spawn_in_fake(&fake).await.expect("spawn");
+        let old_session = handle.session_id.clone().expect("session id");
+        exit_agent(&fake, &handle).await;
+
+        restart_agent_in_place(
+            &fake,
+            &mut handle,
+            &model("claude+agent-tools"),
+            10_000,
+            &LaunchExtras::default(),
+            None,
+            OWNER,
+        )
+        .await
+        .expect("restart");
+
+        let new_session = handle.session_id.clone().expect("a new session id");
+        assert_ne!(new_session, old_session);
+        let (text, _) = last_send_input(&fake);
+        assert!(
+            text.ends_with(&format!("--session-id {new_session}")) && !text.contains("--resume"),
+            "got {text}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restart_in_place_resumes_codex_through_its_subcommand() {
+        let fake = FakeHerdr::new().with_turns([ScriptedTurn::Exit]);
+        let workspace_id = ensure_workspace(&fake, "openai-api").await.expect("ws");
+        let mut handle = spawn_agent(
+            &fake,
+            &workspace_id,
+            &codex_model(),
+            Path::new("/tmp"),
+            10_000,
+            OWNER,
+        )
+        .await
+        .expect("spawn codex");
+        let pane_id = handle.pane_id.clone();
+        exit_agent(&fake, &handle).await;
+
+        restart_agent_in_place(
+            &fake,
+            &mut handle,
+            &codex_model(),
+            10_000,
+            &LaunchExtras::default(),
+            Some("rollout-7"),
+            OWNER,
+        )
+        .await
+        .expect("restart");
+
+        assert!(handle.ready);
+        assert_eq!(handle.pane_id, pane_id);
+        assert!(
+            handle.session_id.is_none(),
+            "the new rollout id arrives through agent_session"
+        );
+        let (text, _) = last_send_input(&fake);
+        assert!(
+            text.starts_with("codex resume rollout-7"),
+            "codex resumes through its subcommand: {text}"
+        );
     }
 }

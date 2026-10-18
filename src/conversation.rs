@@ -182,6 +182,9 @@ pub enum Classification {
     Busy(ConversationId),
     Fork(ConversationId),
     SideRequest(ConversationId),
+    /// The key is known but the request names another model: same record and the
+    /// same conversation, only the backing CLI is swapped.
+    ModelSwitch(ConversationId),
 }
 
 #[derive(Debug, Default)]
@@ -223,8 +226,20 @@ impl Registry {
         let users = user_digests(req);
         let count = non_system_count(req);
         if let Some(key) = &req.conversation_key {
-            return match self.find_by_key(&req.model, key) {
-                Some(record) => self.relate(record, req, &digest, &users, count, now, true),
+            return match self.find_by_key(key) {
+                Some(record) => {
+                    let related = self.relate(record, req, &digest, &users, count, now, true);
+                    // A conversation keeps one backing agent, so a continuation
+                    // under another model switches the CLI on the same record.
+                    // Other relations (Busy, Fork, SideRequest, DialogAnswer)
+                    // belong to the turn the current model is running.
+                    if record.model_id != req.model
+                        && matches!(related, Classification::Continue { .. })
+                    {
+                        return Classification::ModelSwitch(record.id);
+                    }
+                    related
+                }
                 None => Classification::New {
                     bootstrap: bootstrap_flag(req),
                 },
@@ -589,6 +604,21 @@ impl Registry {
         }
     }
 
+    /// Point a record at another model; the caller swaps the backing CLI.
+    pub fn set_model(&mut self, id: ConversationId, model_id: &str) {
+        if let Some(record) = self.records.get_mut(&id) {
+            record.model_id = model_id.to_string();
+        }
+    }
+
+    /// Forget what the backing agent has already seen. A CLI that starts with no
+    /// session of its own must be sent the whole conversation again.
+    pub fn reset_consumed(&mut self, id: ConversationId) {
+        if let Some(record) = self.records.get_mut(&id) {
+            record.consumed = 0;
+        }
+    }
+
     pub fn remove(&mut self, id: ConversationId) -> Option<ConversationRecord> {
         self.records.remove(&id)
     }
@@ -629,10 +659,11 @@ impl Registry {
         self.records.len()
     }
 
-    fn find_by_key(&self, model_id: &str, key: &str) -> Option<&ConversationRecord> {
+    /// The conversation key is unique across models: one thread, one record.
+    fn find_by_key(&self, key: &str) -> Option<&ConversationRecord> {
         self.records
             .values()
-            .find(|record| record.model_id == model_id && record.key.as_deref() == Some(key))
+            .find(|record| record.key.as_deref() == Some(key))
     }
 }
 
@@ -750,6 +781,66 @@ mod tests {
             }
             other => panic!("expected continue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn keyed_model_switch_reuses_the_same_record() {
+        let now = base();
+        let mut registry = Registry::default();
+        let first = req("claude", Some("k1"), vec![user("hello")]);
+        let id = registry.create("claude", Some("k1".to_string()), cwd(), now);
+        registry.begin(id, request_digest(&first), &first);
+        registry.commit(id, reply("hi"), now);
+
+        let switched = req(
+            "claude-personal",
+            Some("k1"),
+            vec![user("hello"), assistant("hi"), user("next question")],
+        );
+        assert_eq!(
+            registry.classify(&switched, now),
+            Classification::ModelSwitch(id),
+            "another model on the same key switches the CLI, it never starts a second conversation"
+        );
+        registry.set_model(id, "claude-personal");
+        let record = registry.get(id).expect("record");
+        assert_eq!(record.model_id, "claude-personal");
+        assert_eq!(registry.count_total(), 1);
+        assert_eq!(registry.count_for_model("claude"), 0);
+        assert_eq!(registry.count_for_model("claude-personal"), 1);
+    }
+
+    #[test]
+    fn another_model_cannot_take_over_a_running_turn() {
+        let now = base();
+        let mut registry = Registry::default();
+        let first = req("claude", Some("k1"), vec![user("hello")]);
+        let id = registry.create("claude", Some("k1".to_string()), cwd(), now);
+        registry.begin(id, request_digest(&first), &first);
+
+        let switched = req(
+            "claude-personal",
+            Some("k1"),
+            vec![user("hello"), user("next question")],
+        );
+        assert_eq!(registry.classify(&switched, now), Classification::Busy(id));
+    }
+
+    #[test]
+    fn keyed_other_model_without_history_is_a_side_request() {
+        let now = base();
+        let mut registry = Registry::default();
+        let first = req("claude", Some("k1"), vec![user("hello")]);
+        let id = registry.create("claude", Some("k1".to_string()), cwd(), now);
+        registry.begin(id, request_digest(&first), &first);
+        registry.commit(id, reply("hi"), now);
+
+        let side = req("codex", Some("k1"), vec![user("summarize this chat title")]);
+        assert_eq!(
+            registry.classify(&side, now),
+            Classification::SideRequest(id),
+            "the key is found even under another model, so no second pane appears"
+        );
     }
 
     #[test]

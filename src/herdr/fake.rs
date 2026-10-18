@@ -190,6 +190,9 @@ struct State {
     hide_agent_session: bool,
     read_fails: bool,
     name_target_fails: bool,
+    /// `pane.send_input` fails when it carries text, simulating a pane that
+    /// will not accept a typed command.
+    send_input_fails: bool,
     /// `agent_read` (Detection) shows a dialog cursor key's effect only after
     /// this many further reads; `usize::MAX` freezes the rendered cursor.
     render_lag: usize,
@@ -301,6 +304,12 @@ impl FakeHerdr {
     pub fn with_name_target_fails(self) -> Self {
         self.lock().name_target_fails = true;
         self
+    }
+
+    /// Toggle `pane.send_input` failures for typed text at runtime, e.g. to make
+    /// a command typed into a pane shell be rejected.
+    pub fn set_send_input_fails(&self, fails: bool) {
+        self.lock().send_input_fails = fails;
     }
 
     /// The rendered dialog cursor trails the real one by `lag` reads: a key's
@@ -511,9 +520,11 @@ fn unavailable_error() -> HerdrError {
     }
 }
 
+/// The session a launched CLI writes to: `--session-id` starts one, `--resume`
+/// continues the same `<id>.jsonl`.
 fn session_id_from_args(args: &[String]) -> Option<String> {
     args.iter()
-        .position(|arg| arg == "--session-id")
+        .position(|arg| arg == "--session-id" || arg == "--resume")
         .and_then(|index| args.get(index + 1))
         .cloned()
 }
@@ -840,6 +851,17 @@ impl HerdrApi for FakeHerdr {
             return Err(api_error("tab_not_found", "unknown tab"));
         }
         state.agents.retain(|agent| agent.tab_id != tab_id);
+        // The tab's panes go with it, tokens included.
+        let closed_panes: Vec<String> = state
+            .panes
+            .iter()
+            .filter(|(_, tab)| tab == tab_id)
+            .map(|(pane_id, _)| pane_id.clone())
+            .collect();
+        state.panes.retain(|(_, tab)| tab != tab_id);
+        for pane_id in closed_panes {
+            state.pane_tokens.remove(&pane_id);
+        }
         // Closing the last tab closes the workspace, like real herdr.
         let alive_workspaces: Vec<String> = state
             .tabs
@@ -948,6 +970,9 @@ impl HerdrApi for FakeHerdr {
             .find(|(id, _)| id == pane_id)
             .map(|(_, tab_id)| tab_id.clone())
             .ok_or_else(|| api_error("pane_not_found", "no such pane"))?;
+        if state.send_input_fails && !text.is_empty() {
+            return Err(api_error("pane_input_failed", "fake pane input fails"));
+        }
         // A typed command that matches a scripted variant launches the agent
         // in the pane, like a shell function exec'ing the real CLI.
         let first_word = text.split_whitespace().next().unwrap_or("");
@@ -955,10 +980,40 @@ impl HerdrApi for FakeHerdr {
             .variant_commands
             .iter()
             .find(|(command, _)| command == first_word)
-            .map(|(_, kind)| kind.clone());
+            .map(|(_, kind)| kind.clone())
+            .or_else(|| {
+                // herdr detects the built-in CLIs by process, so a typed
+                // `claude` or `codex` starts an agent like a shell function does.
+                matches!(first_word, "claude" | "codex").then(|| first_word.to_string())
+            });
         let Some(kind) = kind else {
             return Ok(());
         };
+        // Real herdr types into whatever owns the pane: with a live agent there,
+        // the text becomes a user prompt for that agent instead of launching a
+        // second one, and the call log shows it.
+        let live = state
+            .agents
+            .iter()
+            .position(|agent| agent.pane_id == pane_id && !agent.exiting);
+        if let Some(index) = live {
+            state.agents[index].status = AgentStatus::Working;
+            let name = state.agents[index].name.clone();
+            state.calls.push(call(
+                "agent.prompt",
+                vec![
+                    ("target", name),
+                    ("text", text.to_string()),
+                    ("source", "pane_input".to_string()),
+                ],
+            ));
+            return Ok(());
+        }
+        // A CLI that fails to start never shows up as an agent, like a failing
+        // `agent.start`.
+        if matches!(state.startup, StartupBehavior::Fails) {
+            return Ok(());
+        }
         let workspace_id = state
             .tabs
             .iter()

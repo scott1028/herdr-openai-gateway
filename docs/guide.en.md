@@ -149,6 +149,10 @@ One client conversation maps to one agent tab in herdr. The server recognizes a 
 `x-herdr-conversation`, `x-opencode-session-id`, `x-session-id`, `prompt_cache_key` in the body,
 and finally `user`.
 
+The key never includes the model, so one key always lands on one conversation. Switching model
+mid-conversation only replaces the CLI behind it: the old tab closes and a new one opens, the whole
+history is replayed, and the conversation id and the key stay the same.
+
 If there is no key at all, it compares message history instead. If exactly one open conversation
 with the same model and no key continues it, the request goes there; otherwise a new conversation
 starts.
@@ -178,6 +182,9 @@ Other rules:
 - A request that reuses a conversation key but contains no assistant messages at all is treated
   as a side request (such as generating a title or compacting the conversation) and gets HTTP 409
   right away. For the fix, see `small_model` in [Using it with opencode](#using-it-with-opencode).
+  The key ignores the model, so pointing `small_model` at another model of this gateway keeps the
+  title request on the same key: if it arrives first, it claims the conversation and the main
+  request gets 409 for that attempt.
 
 ### Whose tab is it
 

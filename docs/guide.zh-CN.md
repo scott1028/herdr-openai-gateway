@@ -131,6 +131,9 @@ CODEX_HOME=~/.codex-personal herdr integration install codex
 先找到哪个就用哪个：`x-herdr-conversation`、`x-opencode-session-id`、`x-session-id`、body 里的
 `prompt_cache_key`，最后是 `user`。
 
+key 里面不含 model，所以同一把 key 永远落在同一段对话。中途换 model 只会换掉背后那个 CLI：旧的 tab
+关掉、开一个新的，历史完整重播，对话 id 和 key 都不变。
+
 一把 key 都没有的话，就按历史消息比对：如果刚好只有一段"同 model、没带 key、还开着"的对话接得上，
 就发去那里；不然就开一段新的。
 
@@ -151,7 +154,9 @@ CODEX_HOME=~/.codex-personal herdr integration install codex
   上一个客户端已经自己断开了（例如在 opencode 按 Esc）：这时新请求会接手，agent 先收到一个 `esc`；
   Claude 还会再收到一个 `ctrl+c`，不然它会把被打断的那段提示塞回输入框；然后才送进新的提示。
 - 带着同一把对话 key、却一条 assistant 消息都没有的请求，会被当成附带请求（例如生成标题、压缩对话），
-  直接回 HTTP 409。解决办法见[搭配 opencode](#搭配-opencode) 里的 `small_model`。
+  直接回 HTTP 409。解决办法见[搭配 opencode](#搭配-opencode) 里的 `small_model`。key 不认 model，所以
+  `small_model` 指向本 server 的另一个 model 时，标题请求和主请求还是同一把 key：标题请求先到就会先
+  占住这段对话，主请求那一次会拿到 409。
 
 ### 背后的 tab 是谁的
 
